@@ -1,2 +1,27 @@
 # ignore all .a files
 *.code-workspace
+*.tsv.gz
+*.DS_Store
+*.pyc
+*.pkl
+*.pickle
+*.hdf5
+*.jsonl
+*.json
+*.csv
+*.tsv
+*.db
+*.sqlite3
+*.log
+*.parquet
+*.DS_Store
+__pycache__
+
+# vs code
+.vscode/
+
+#exclude data
+/data/
+
+# explde api key
+/src/data/*.json
