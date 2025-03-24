@@ -1,7 +1,7 @@
 ```bash
-new-project
+f1-forecast-engine
 ========================
-Description:
+Description:  develop model to forecast f 1 outcomes
 
 Projection Organization
 -------------
