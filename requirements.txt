@@ -1,0 +1,28 @@
+# Core pipeline ------------------------------------------------------------
+# fastf1 supplies race results, session telemetry and the Ergast/Jolpica
+# wrapper.  Car and position telemetry exist from 2018, which sets the floor
+# for the modelling window.
+fastf1>=3.8,<4.0
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10              # Savitzky-Golay smoothing for the curvature trace
+pyarrow>=14.0            # parquet, for the cached intermediates
+requests>=2.31           # connectivity probe before a long pull
+
+# Modelling ----------------------------------------------------------------
+scikit-learn>=1.4        # HistGradientBoosting takes NaN natively, which the
+                         # cold-start rows need
+
+# Notebooks and figures ----------------------------------------------------
+matplotlib>=3.7
+ipykernel>=6.0
+
+# Earlier notebooks (0.0-2.0) ---------------------------------------------
+beautifulsoup4>=4.12     # pitwall.app scraping in 1_0_web_scrape
+Unidecode>=1.3           # race-name normalisation in 1_0_web_scrape
+seaborn>=0.13
+tqdm>=4.66
+xgboost>=2.0             # points regressor in 2_0_Model_Development
+
+# Development --------------------------------------------------------------
+pytest>=8.0
