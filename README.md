@@ -104,6 +104,16 @@ sprint and a 305 km grand prix do not share an attrition process.
 
 Full column-by-column reference: [`References/data_dictionary.md`](References/data_dictionary.md).
 
+### Forecasting an upcoming race
+
+Not built yet. The pipeline is designed for races that have already run, and turning it
+into a weekly forecast needs five small modules, not a rewrite — every history feature
+shifts before it aggregates, so a row for an unraced event is already a legal input to
+the existing feature builder.
+
+The plan, the traps it has to avoid, and the weekly ritual it implies:
+[`References/race_weekend_inference.md`](References/race_weekend_inference.md).
+
 ### Evaluating it
 
 **Accuracy is the wrong metric and nothing here reports it.** About one car in seven
@@ -136,6 +146,7 @@ independent.
 |
 |- References
 |  |- data_dictionary.md    <- generated from the feature registry
+|  |- race_weekend_inference.md  <- plan for per-race forecasting (design, not built)
 |
 |- Reports/figures
 |
