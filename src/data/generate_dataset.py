@@ -21,6 +21,11 @@ Run it with::
 or, for a rebuild that reuses cached intermediates::
 
     python -m src.data.generate_dataset --skip-download
+
+``--skip-download`` reuses the *parquet* intermediates and so needs a previous
+successful run.  ``--offline`` is the weaker requirement: it rebuilds from the
+FastF1 cache without any network access, which is the right choice whenever
+that cache is already populated.
 """
 
 from __future__ import annotations
@@ -75,16 +80,32 @@ def parse_seasons(text: str) -> tuple[int, ...]:
 
 
 def collect_raw(
-    seasons: Sequence[int], *, include_sprints: bool = True
+    seasons: Sequence[int], *, include_sprints: bool = True, offline: bool = False
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Download results and circuit profiles.  Requires network access."""
+    """Download results and circuit profiles.
+
+    Args:
+        seasons: Years to collect.
+        include_sprints: Keep sprint results in the raw frame.
+        offline: Serve every request from the FastF1 cache and never touch the
+            network.  A populated cache holds the Ergast result data too, so a
+            rebuild works fully offline -- and avoids re-requesting entries
+            that have merely expired, which is what provokes an HTTP 429 from
+            the Ergast backend and silently drops ``Status`` from a session.
+
+    Returns:
+        ``(results, profiles)``.
+    """
     from src.data import ingest
 
-    ingest.configure()
-    reachable, message = ingest.check_connectivity()
-    if not reachable:
-        raise RuntimeError(message)
-    log.info(message)
+    ingest.configure(offline=offline)
+    if offline:
+        log.info("offline mode: serving every request from the FastF1 cache")
+    else:
+        reachable, message = ingest.check_connectivity()
+        if not reachable:
+            raise RuntimeError(message)
+        log.info(message)
 
     results, results_report = ingest.collect_results(
         seasons, include_sprints=include_sprints
@@ -107,6 +128,31 @@ def _write(frame: pd.DataFrame, path: Path, label: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def collapse_repeat_visits(profiles: pd.DataFrame) -> pd.DataFrame:
+    """Reduce a circuit-season to a single profile row.
+
+    A season can visit the same layout twice: 2020 ran two rounds at both
+    Silverstone and the Red Bull Ring, and 2021 did the same in Austria.  Each
+    round contributes its own reference lap, so the pair is one track measured
+    twice -- lap length differs by metres, which is grid resolution, not
+    geometry.  The median is the better estimate and it keeps
+    ``(circuit_key, year)`` unique, which the profile join relies on.
+    """
+    key = ["circuit_key", "year"]
+    if not set(key).issubset(profiles.columns) or not profiles.duplicated(key).any():
+        return profiles
+
+    numeric = [c for c in profiles.select_dtypes("number").columns if c not in key]
+    other = [c for c in profiles.columns if c not in key and c not in numeric]
+    agg = {**{c: "median" for c in numeric}, **{c: "first" for c in other}}
+    collapsed = profiles.groupby(key, as_index=False, dropna=False).agg(agg)
+    log.info(
+        "collapsed %d repeat-visit profile(s); %d circuit-season(s) remain",
+        len(profiles) - len(collapsed), len(collapsed),
+    )
+    return collapsed[list(profiles.columns)]
+
+
 def prepare_circuit_profiles(profiles: pd.DataFrame) -> pd.DataFrame:
     """Add composite indices and a circuit-level fallback row.
 
@@ -114,10 +160,13 @@ def prepare_circuit_profiles(profiles: pd.DataFrame) -> pd.DataFrame:
     season whose telemetry failed to load falls back to the circuit's median
     profile across the seasons that did, which is better than dropping the
     race and much better than a zero.
+
+    Repeat visits to one layout in a single season are collapsed first, so the
+    key stays unique; see :func:`collapse_repeat_visits`.
     """
     if profiles.empty:
         return profiles
-    scored = add_composite_indices(profiles)
+    scored = add_composite_indices(collapse_repeat_visits(profiles))
     scored["profile_source"] = "measured"
 
     fallback = aggregate_circuit_profiles(scored)
@@ -274,6 +323,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Exclude sprint results from the rolling history.",
     )
     parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Serve every FastF1 request from the cache; never touch the "
+             "network.  Use this when the cache is already populated: it is "
+             "faster and avoids Ergast rate limits.",
+    )
+    parser.add_argument(
         "--out", type=Path, default=config.DNF_DATASET_PATH, help="Output parquet path."
     )
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -301,7 +357,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         try:
             results, profiles = collect_raw(
-                seasons, include_sprints=not args.no_sprints
+                seasons,
+                include_sprints=not args.no_sprints,
+                offline=args.offline,
             )
         except RuntimeError as exc:
             log.error("%s", exc)
