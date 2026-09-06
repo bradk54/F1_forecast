@@ -21,7 +21,7 @@ python -m src.data.generate_dataset --seasons 2018-2025
 # Rebuild feature logic without touching the network.
 python -m src.data.generate_dataset --skip-download
 
-pytest                                    # 125 tests, no network required
+pytest                                    # 195 tests, no network required
 python -m scripts.write_data_dictionary   # regenerate References/data_dictionary.md
 ```
 
@@ -119,6 +119,117 @@ independent.
 
 ---
 
+## From retirement to points
+
+The retirement model is not the destination. `src/models/points_bridge.py` is the
+join to the points model, and the join is less obvious than it looks.
+
+### The simple version, and why it is not enough
+
+```python
+E[points] = P(finish) * E[points | finish]
+```
+
+`expected_points()` implements exactly that, and it is fine as a point estimate when
+you already have a points model conditional on finishing. But points are awarded by
+finishing *position*, and position depends on who else is still running. A driver
+running eleventh scores nothing; if five cars ahead retire, that same driver finishes
+sixth and scores eight. So `E[points | finish]` is not a fixed quantity — it depends on
+the whole grid's retirement pattern.
+
+### Random effects: the shared shock
+
+Retirements cluster. Rain, a first-lap pile-up, a safety car, a red flag — one event
+takes several cars out at once. Every model in `train.py` treats driver-races as
+independent, which gets each driver's marginal probability right and still produces a
+distribution of finisher counts far too narrow.
+
+`src/models/hierarchical.py` adds a random intercept per race:
+
+```
+logit(p_ij) = eta_ij + u_i,     u_i ~ N(0, sigma^2)
+```
+
+`eta_ij` comes from *any* mean model, so this composes with whichever model won the
+comparison rather than replacing it. `estimate_race_shock()` fits `sigma` by
+Gauss-Hermite quadrature on the exact marginal likelihood, holding the mean model
+fixed.
+
+Two details that are easy to get wrong and are handled here:
+
+- **Marginal vs conditional.** Adding a mean-zero shock inside a logit does *not*
+  preserve the marginal probability — `expit` is convex below 0.5. Feed a
+  marginally-calibrated probability straight in and every prediction shifts. For a 14%
+  event at `sigma = 1.0`, the naive route over-predicts retirements by about 4
+  percentage points. `marginal_to_conditional()` solves for the exact `eta` by Newton
+  iteration rather than using the usual `sqrt(1 + 0.346*sigma^2)` approximation.
+- **Self-consistency.** The likelihood must recompute that conversion at each candidate
+  `sigma`. Holding `eta` at `logit(p)` instead leaves a downward bias of a few percent
+  that does *not* shrink with sample size.
+
+Validated by planting a known shock and recovering it: at 600 races the estimator is
+unbiased to within 0.01 with a standard deviation around 0.04.
+
+### The effect is first-order, not a refinement
+
+Simulating a stylised twenty-car race at a 14% retirement rate, moving from independent
+retirements to `sigma = 0.8`:
+
+| grid | expected points, independent | expected points, correlated | change |
+| --- | --- | --- | --- |
+| 1st | 20.2 | 18.1 | −10% |
+| 15th | 1.09 | 1.85 | +70% |
+| 20th | 0.40 | 1.18 | +197% |
+
+Every driver's retirement probability is identical in both columns. What changes is the
+joint distribution — and points are a nonlinear function of it. The direction follows
+from Jensen's inequality: a back-marker only scores when several cars ahead retire, so
+their points are a **convex** function of attrition and more variance raises their
+expectation; a front-runner is near the top of the table already, so their payoff is
+**concave** and theirs falls. Points are conserved, so the whole thing is a transfer
+down the grid.
+
+**A points model built on independent retirements systematically under-rates the back of
+the grid and over-rates the front.**
+
+### Which model to carry forward
+
+For a points model, **calibration is the binding constraint, not ranking**. Expected
+points scales linearly in `P(finish)`, so a calibration slope of 0.7 biases every
+driver's forecast even when the ordering is perfect. `run_model_comparison.py` picks the
+highest-skill model *among those calibrated within [0.85, 1.15]* rather than the
+highest-skill model outright.
+
+The suite covers logistic regression, random forest, `HistGradientBoosting`, XGBoost and
+LightGBM, plus Platt and isotonic calibrated variants. `scale_pos_weight` is deliberately
+never set: it buys ranking metrics and sells calibration.
+
+```bash
+python -m scripts.run_model_comparison
+```
+
+Writes `model_comparison.csv`, `feature_ablation.csv`, `race_shock.csv` and
+`points_correlation_impact.csv` to `Reports/`.
+
+### Checking the shock is real
+
+`check_attrition_calibration()` is a better diagnostic than the likelihood-ratio test,
+which runs anti-conservative at this sample size (it rejected nearer 15% than 5% under a
+simulated null). It compares the simulated spread of per-race retirement counts against
+the observed one:
+
+```
+    scenario  mean    sd  p90    max
+    observed 3.160 2.491  7.0 12.000
+ independent 3.265 1.643  5.0  8.348
+sigma_fitted 3.266 2.496  7.0 12.588
+```
+
+The fitted row should track the observed row; the independent row shows what assuming
+independence costs you.
+
+---
+
 ## Layout
 
 ```
@@ -141,6 +252,7 @@ independent.
 |
 |- scripts
 |  |- write_data_dictionary.py
+|  |- run_model_comparison.py
 |
 |- src
 |  |- config.py             <- repo-relative paths and pipeline constants
@@ -154,7 +266,9 @@ independent.
 |  |  |- build_features.py  <- leakage-safe rolling history
 |  |  |- registry.py        <- feature catalogue with stage tags
 |  |- models
-|     |- train.py           <- baselines, walk-forward evaluation, ablation
+|     |- train.py           <- model zoo, walk-forward evaluation, ablation
+|     |- hierarchical.py    <- race random effects, correlated simulation
+|     |- points_bridge.py   <- P(finish) -> expected points
 |
 |- tests
    |- synthetic.py          <- FastF1-shaped fixtures; no network needed
@@ -166,7 +280,7 @@ independent.
 pytest -q
 ```
 
-125 tests, none of which touch the network. The F1 APIs are rate-limited everywhere and
+195 tests, none of which touch the network. The F1 APIs are rate-limited everywhere and
 blocked outright on some networks, so the pipeline is validated against generated data whose
 schema matches FastF1's. `tests/synthetic.py` builds circuits from segment lists and Fourier
 series and runs a quasi-steady-state lap simulation over them, which means the geometry has

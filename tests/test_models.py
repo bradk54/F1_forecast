@@ -128,3 +128,85 @@ def test_race_bootstrap_resamples_whole_races(modelling_dataset) -> None:
 def test_missing_target_raises(modelling_dataset) -> None:
     with pytest.raises(KeyError, match="target"):
         walk_forward_evaluate(modelling_dataset, target="not_a_column")
+
+
+# --------------------------------------------------------------------------- #
+# The extended model zoo
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["logistic", "random_forest", "gradient_boosting", "xgboost", "lightgbm",
+     "xgboost_sigmoid", "xgboost_isotonic", "gradient_boosting_sigmoid"],
+)
+def test_every_registered_model_runs(modelling_dataset, model: str) -> None:
+    from src.models.train import walk_forward_evaluate
+
+    result = walk_forward_evaluate(modelling_dataset, model=model)
+    assert not result.scores.empty, model
+    assert result.predictions["predicted"].between(0, 1).all(), model
+
+
+def test_boosters_do_not_reweight_the_positive_class() -> None:
+    """``scale_pos_weight`` buys ranking and sells calibration.
+
+    Expected points scales linearly in P(finish), so an inflated probability is
+    a biased points forecast even when the ordering is perfect.
+    """
+    from src.models.train import make_xgboost
+
+    pipeline = make_xgboost(["a", "b"], [])
+    classifier = pipeline.named_steps["clf"]
+    assert getattr(classifier, "scale_pos_weight", None) in (None, 1, 1.0)
+
+
+def test_nan_native_models_receive_unimputed_values() -> None:
+    """Cold-start rows are exactly where risk is unusual, so a rookie's missing
+    history must stay missing rather than become the median."""
+    from src.models.train import make_xgboost
+
+    prep = make_xgboost(["a", "b"], []).named_steps["prep"]
+    assert prep.transformers[0][1] == "passthrough"
+
+
+def test_xgboost_handles_missing_features(modelling_dataset) -> None:
+    from src.models.train import walk_forward_evaluate
+
+    frame = modelling_dataset.copy()
+    frame.loc[frame.index[:50], "driver_dnf_rate_10"] = np.nan
+    result = walk_forward_evaluate(frame, model="xgboost")
+    assert result.predictions["predicted"].notna().all()
+
+
+def test_compare_models_ranks_by_skill(modelling_dataset) -> None:
+    from src.models.train import compare_models
+
+    comparison = compare_models(
+        modelling_dataset,
+        models=("logistic", "xgboost", "random_forest"),
+        stages=("post_quali",),
+    )
+    assert len(comparison) == 3
+    assert comparison["brier_skill"].is_monotonic_decreasing
+
+
+def test_compare_models_survives_a_bad_model(modelling_dataset) -> None:
+    """One failing model must not abort the sweep."""
+    from src.models.train import compare_models
+
+    comparison = compare_models(
+        modelling_dataset,
+        models=("logistic", "does_not_exist"),
+        stages=("post_quali",),
+    )
+    assert set(comparison["model"]) == {"logistic"}
+
+
+def test_fit_final_model_trains_through_a_season(modelling_dataset) -> None:
+    from src.models.train import fit_final_model
+
+    estimator, features = fit_final_model(modelling_dataset, model="xgboost")
+    probabilities = estimator.predict_proba(modelling_dataset[features])[:, 1]
+    assert len(features) > 10
+    assert ((probabilities >= 0) & (probabilities <= 1)).all()

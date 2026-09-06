@@ -149,10 +149,191 @@ def make_gradient_boosting(
     )
 
 
-MODEL_FACTORIES = {
+def _tree_preprocessor(
+    numeric: Sequence[str], categorical: Sequence[str]
+) -> ColumnTransformer:
+    """Passthrough for numerics, one-hot for categoricals.
+
+    Tree ensembles that handle NaN natively need no imputation, so the numeric
+    block is passed straight through and missingness stays informative.
+    """
+    steps: list[tuple[str, Any, list[str]]] = [("num", "passthrough", list(numeric))]
+    if categorical:
+        steps.append(
+            ("cat", OneHotEncoder(handle_unknown="ignore", drop="first"), list(categorical))
+        )
+    return ColumnTransformer(steps, remainder="drop")
+
+
+def make_xgboost(numeric: Sequence[str], categorical: Sequence[str]) -> Pipeline:
+    """XGBoost, tuned conservatively for a small, noisy, rare-event problem.
+
+    Roughly 4,000 driver-races with a 14% positive rate is not much signal, so
+    the settings lean hard on regularisation: shallow trees, heavy subsampling,
+    a large ``min_child_weight`` and explicit L1/L2 penalties.  Left at library
+    defaults, XGBoost will happily memorise which driver retired at which
+    circuit in 2019.
+
+    ``scale_pos_weight`` is deliberately **not** set.  It improves ranking
+    metrics and wrecks calibration by inflating every predicted probability,
+    and the downstream points model needs probabilities that mean what they
+    say — a P(finish) of 0.85 has to show up as a finish 85% of the time or
+    expected points come out wrong.
+    """
+    from xgboost import XGBClassifier
+
+    return Pipeline(
+        [
+            ("prep", _tree_preprocessor(numeric, categorical)),
+            (
+                "clf",
+                XGBClassifier(
+                    n_estimators=400,
+                    learning_rate=0.03,
+                    max_depth=3,
+                    min_child_weight=20,
+                    subsample=0.8,
+                    colsample_bytree=0.6,
+                    reg_alpha=0.5,
+                    reg_lambda=2.0,
+                    gamma=0.1,
+                    objective="binary:logistic",
+                    eval_metric="logloss",
+                    tree_method="hist",
+                    missing=np.nan,
+                    random_state=config.RANDOM_SEED,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+
+def make_lightgbm(numeric: Sequence[str], categorical: Sequence[str]) -> Pipeline:
+    """LightGBM, the leaf-wise counterpart to XGBoost's depth-wise growth.
+
+    Included because it disagrees with XGBoost in useful ways on small data:
+    leaf-wise growth finds interactions sooner and overfits sooner, so
+    ``num_leaves`` is kept small and ``min_child_samples`` large.  If the two
+    land in the same place, that is evidence the signal is real rather than an
+    artefact of one library's inductive bias.
+    """
+    from lightgbm import LGBMClassifier
+
+    return Pipeline(
+        [
+            ("prep", _tree_preprocessor(numeric, categorical)),
+            (
+                "clf",
+                LGBMClassifier(
+                    n_estimators=400,
+                    learning_rate=0.03,
+                    num_leaves=8,
+                    max_depth=4,
+                    min_child_samples=30,
+                    subsample=0.8,
+                    subsample_freq=1,
+                    colsample_bytree=0.6,
+                    reg_alpha=0.5,
+                    reg_lambda=2.0,
+                    random_state=config.RANDOM_SEED,
+                    n_jobs=-1,
+                    verbose=-1,
+                ),
+            ),
+        ]
+    )
+
+
+def make_random_forest(numeric: Sequence[str], categorical: Sequence[str]) -> Pipeline:
+    """Random forest: a high-variance, low-bias contrast to the boosters.
+
+    Forests average many deep trees rather than correcting a weak one, so they
+    tend to be better calibrated out of the box and worse at ranking.  Useful
+    as a third opinion.  Needs imputation — scikit-learn's forest has no NaN
+    branch.
+    """
+    from sklearn.ensemble import RandomForestClassifier
+
+    numeric_pipe = Pipeline([("impute", SimpleImputer(strategy="median"))])
+    steps: list[tuple[str, Any, list[str]]] = [("num", numeric_pipe, list(numeric))]
+    if categorical:
+        steps.append(
+            ("cat", OneHotEncoder(handle_unknown="ignore", drop="first"), list(categorical))
+        )
+    return Pipeline(
+        [
+            ("prep", ColumnTransformer(steps, remainder="drop")),
+            (
+                "clf",
+                RandomForestClassifier(
+                    n_estimators=500,
+                    max_depth=8,
+                    min_samples_leaf=20,
+                    max_features="sqrt",
+                    random_state=config.RANDOM_SEED,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+
+def make_calibrated(
+    base: str, method: str = "isotonic", cv: int = 5
+) -> "Callable[[Sequence[str], Sequence[str]], Pipeline]":
+    """Wrap a model factory in cross-validated probability calibration.
+
+    Boosted trees are usually overconfident at the extremes, which matters more
+    here than anywhere: expected points is ``P(finish) * E[points | finish]``,
+    so a probability that is wrong by 5 points is a points forecast that is
+    wrong by 5%.
+
+    ``isotonic`` is non-parametric and can fix any monotone distortion, but it
+    needs data and will overfit a small calibration fold; ``sigmoid`` (Platt)
+    fits two parameters and is the safer choice under a few thousand rows.  Try
+    both — :func:`compare_models` does.
+
+    The calibration folds come from the training seasons only, so this stays
+    inside the walk-forward discipline.
+    """
+
+    def factory(numeric: Sequence[str], categorical: Sequence[str]) -> Pipeline:
+        from sklearn.calibration import CalibratedClassifierCV
+
+        inner = MODEL_FACTORIES[base](numeric, categorical)
+        return Pipeline([("calibrated", CalibratedClassifierCV(inner, method=method, cv=cv))])
+
+    return factory
+
+
+MODEL_FACTORIES: dict[str, Any] = {
     "logistic": make_logistic,
     "gradient_boosting": make_gradient_boosting,
+    "xgboost": make_xgboost,
+    "lightgbm": make_lightgbm,
+    "random_forest": make_random_forest,
 }
+
+# Calibrated variants, registered after the base models they wrap.
+MODEL_FACTORIES["xgboost_isotonic"] = make_calibrated("xgboost", "isotonic")
+MODEL_FACTORIES["xgboost_sigmoid"] = make_calibrated("xgboost", "sigmoid")
+MODEL_FACTORIES["gradient_boosting_sigmoid"] = make_calibrated(
+    "gradient_boosting", "sigmoid"
+)
+MODEL_FACTORIES["lightgbm_sigmoid"] = make_calibrated("lightgbm", "sigmoid")
+
+#: A sensible sweep for :func:`compare_models`, ordered simplest first.
+DEFAULT_MODEL_SUITE = (
+    "logistic",
+    "random_forest",
+    "gradient_boosting",
+    "xgboost",
+    "lightgbm",
+    "xgboost_sigmoid",
+    "xgboost_isotonic",
+    "gradient_boosting_sigmoid",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -503,3 +684,102 @@ def race_bootstrap(
         "ci_high": float(np.percentile(values, 97.5)),
         "n_boot": int(values.size),
     }
+
+
+def compare_models(
+    dataset: pd.DataFrame,
+    *,
+    models: Sequence[str] = DEFAULT_MODEL_SUITE,
+    stages: Sequence[registry.Stage] = ("pre_weekend", "post_quali"),
+    sort_by: str = "brier_skill",
+    **kwargs,
+) -> pd.DataFrame:
+    """Walk-forward every model at every stage and rank the results.
+
+    Read the table in this order:
+
+    1. ``brier_skill`` — is the model worth anything at all?  Zero means it has
+       learnt nothing beyond the base rate.
+    2. ``calibration_slope`` — can the probabilities be taken at face value?
+       This is the column that matters most for a downstream points model, and
+       it is routinely the one where the best-ranking model loses.
+    3. ``pr_auc`` — ranking quality at a 14% positive rate.  Compare it against
+       the base rate, never against 0.5.
+
+    A model that wins on skill and sits at a slope of 0.7 is overconfident, and
+    feeding its probabilities into an expected-points calculation will bias
+    every driver's forecast.  Prefer the calibrated variant even at a small
+    cost in skill.
+    """
+    rows = []
+    for stage in stages:
+        for model in models:
+            try:
+                result = walk_forward_evaluate(
+                    dataset, stage=stage, model=model, **kwargs
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad model must not stop the sweep
+                log.warning("%s at %s failed: %s", model, stage, exc)
+                continue
+            if result.scores.empty:
+                continue
+            summary = result.summary()
+            rows.append(
+                {
+                    "stage": stage,
+                    "model": model,
+                    "n_features": len(result.features),
+                    **{
+                        key: round(float(summary[key]), 4)
+                        for key in (
+                            "brier", "brier_skill", "log_loss",
+                            "roc_auc", "pr_auc", "calibration_slope",
+                            "mean_predicted", "observed_rate",
+                        )
+                        if key in summary
+                    },
+                }
+            )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    return frame.sort_values(
+        ["stage", sort_by], ascending=[True, False], ignore_index=True
+    )
+
+
+def fit_final_model(
+    dataset: pd.DataFrame,
+    *,
+    stage: registry.Stage = "post_quali",
+    model: str = "xgboost_sigmoid",
+    target: str = TARGET,
+    train_through_season: int | None = None,
+) -> tuple[Any, list[str]]:
+    """Fit one model on everything up to and including a season, ready to serve.
+
+    Args:
+        train_through_season: Last season to train on, inclusive.  Defaults to
+            every season in the dataset, which is what you want when predicting
+            the next race rather than backtesting.
+
+    Returns:
+        ``(fitted_estimator, feature_names)``.  Pass the feature names to
+        ``estimator.predict_proba`` in the same order.
+    """
+    frame = dataset
+    if train_through_season is not None:
+        frame = frame.loc[frame["Year"] <= train_through_season]
+
+    available = set(frame.columns)
+    selected = registry.feature_columns(stage, available=available)
+    numeric = [c for c in selected if registry.BY_NAME[c].kind in ("numeric", "binary")]
+    categorical = [c for c in selected if c not in numeric]
+
+    estimator = MODEL_FACTORIES[model](numeric, categorical)
+    estimator.fit(frame[selected], frame[target])
+    log.info(
+        "fitted %s on %d rows through %s using %d features",
+        model, len(frame), frame["Year"].max(), len(selected),
+    )
+    return estimator, selected
