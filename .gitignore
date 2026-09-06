@@ -36,3 +36,7 @@ Data/raw/fastf1_cache/
 
 # Keep the generated documentation, which is small and worth reviewing in diffs.
 !References/*.md
+
+# Local virtualenv for the DNF pipeline (see requirements.txt).
+.venv/
+venv/

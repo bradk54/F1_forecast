@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -153,6 +154,89 @@ def check_connectivity(timeout: float = 15.0) -> tuple[bool, str]:
     return True, "F1 data hosts reachable."
 
 
+#: Substrings that mark a failure as transient whatever exception type carries
+#: it.  FastF1 raises ``ErgastInvalidRequestError`` for *every* non-200 from the
+#: Ergast backend, so an HTTP 429 and a genuinely malformed request arrive as
+#: the same class and can only be told apart by the message.  These are checked
+#: first and win over every permanent rule below.
+TRANSIENT_MESSAGE_MARKERS = (
+    "too many requests",
+    "rate limit",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "internal server error",
+)
+
+#: ``ValueError`` messages from FastF1's schedule lookup that mean the session
+#: is simply not in the calendar.  Kept as substrings because FastF1 formats
+#: the identifier into the message.
+PERMANENT_VALUE_ERROR_MARKERS = (
+    "does not exist",
+    "invalid session type",
+    "invalid round",
+    "cannot get testing event",
+)
+
+
+@lru_cache(maxsize=1)
+def _permanent_error_types() -> tuple[type[BaseException], ...]:
+    """FastF1 exception classes that mean "this session will never load".
+
+    Resolved lazily so this module stays importable without fastf1, and
+    defensively because ``SessionNotAvailableError`` lives in a private module:
+    the ``fastf1.api`` shim that re-exports it warns on import.
+    """
+    try:
+        from fastf1.exceptions import (
+            ErgastInvalidRequestError,
+            InvalidSessionError,
+            NoLapDataError,
+            RateLimitExceededError,
+        )
+    except ImportError:  # fastf1 absent; the message check below still applies
+        return ()
+
+    types: list[type[BaseException]] = [
+        InvalidSessionError,        # no session matches this event/type/year
+        NoLapDataError,             # request succeeded, no usable data returned
+        ErgastInvalidRequestError,  # server rejected the request as invalid
+                                    # (except HTTP 429 -- see the markers above)
+        RateLimitExceededError,     # fastf1's own limiter; the window is hours,
+                                    # so a seconds-long backoff cannot clear it
+    ]
+    try:
+        from fastf1._api import SessionNotAvailableError
+    except ImportError:  # pragma: no cover - depends on the fastf1 version
+        pass
+    else:
+        types.append(SessionNotAvailableError)  # cancelled or absent session
+    return tuple(types)
+
+
+def is_permanent_failure(exc: BaseException) -> bool:
+    """True when re-requesting the same session cannot change the outcome.
+
+    A sprint before 2021, a cancelled event or a round outside the calendar
+    fails identically every time.  Backing off between identical attempts only
+    burns wall-clock: a 2018-2020 pull spends about six seconds per event
+    retrying a sprint that was never scheduled.
+    """
+    message = str(exc).lower()
+    # Checked first: a rate-limited or briefly-broken server says nothing about
+    # whether the session exists.
+    if any(marker in message for marker in TRANSIENT_MESSAGE_MARKERS):
+        return False
+    if isinstance(exc, _permanent_error_types()):
+        return True
+    # ``ValueError`` is overloaded in fastf1.events.  Most instances mean "not
+    # in the calendar", but "Failed to load any schedule data." is a network
+    # failure and has to stay retryable.
+    if isinstance(exc, ValueError):
+        return any(marker in message for marker in PERMANENT_VALUE_ERROR_MARKERS)
+    return False
+
+
 def load_session(
     year: int,
     event: str | int,
@@ -166,6 +250,10 @@ def load_session(
     backoff_s: float = 2.0,
 ):
     """Load one session, retrying transient failures with exponential backoff.
+
+    Failures that cannot resolve themselves -- a sprint that was never on the
+    calendar, a cancelled session -- are raised on the first attempt instead of
+    being slept over; see :func:`is_permanent_failure`.
 
     ``telemetry=True`` is expensive; leave it off unless the caller needs a
     reference lap.
@@ -182,6 +270,12 @@ def load_session(
             return session
         except Exception as exc:  # noqa: BLE001 - surfaced through the report
             last = exc
+            if is_permanent_failure(exc):
+                log.debug(
+                    "load %s %s %s failed permanently (%s); not retrying",
+                    year, event, session_type, exc,
+                )
+                break
             if attempt < retries - 1:
                 delay = backoff_s * (2**attempt)
                 log.warning(
@@ -195,6 +289,24 @@ def load_session(
 # --------------------------------------------------------------------------- #
 # Results
 # --------------------------------------------------------------------------- #
+
+
+def optional_session_attr(session, name: str, default=np.nan):
+    """Read a ``Session`` property that the requested load may not have filled.
+
+    ``getattr(session, name, default)`` looks like it covers this, but does
+    not: FastF1 properties raise
+    :class:`~fastf1.exceptions.DataNotLoadedError` when the relevant part of
+    the session was never loaded, and ``getattr`` only swallows
+    ``AttributeError``.  ``total_laps`` is the case that bites -- it is
+    populated solely by the lap-loading path, which the results pass skips on
+    purpose because laps are expensive and nothing downstream models them.
+    """
+    try:
+        value = getattr(session, name)
+    except Exception:  # noqa: BLE001 - any load-state failure means "absent"
+        return default
+    return default if value is None else value
 
 
 def extract_results(
@@ -246,7 +358,7 @@ def extract_results(
     frame["Country"] = event.get("Country")
     frame["RaceDate"] = pd.to_datetime(event["EventDate"])
     frame["session_type"] = session_label
-    frame["total_laps"] = getattr(session, "total_laps", np.nan)
+    frame["total_laps"] = optional_session_attr(session, "total_laps")
 
     try:
         meeting = session.session_info["Meeting"]["Circuit"]

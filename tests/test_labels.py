@@ -242,3 +242,24 @@ def test_label_summary_shape(labelled_results: pd.DataFrame) -> None:
 def test_missing_status_column_raises() -> None:
     with pytest.raises(KeyError, match="Status"):
         add_race_outcome_labels(pd.DataFrame({"Other": [1]}))
+
+
+@pytest.mark.parametrize("status", ["Lapped", "lapped", " Lapped "])
+def test_lapped_is_a_finish_not_a_retirement(status: str) -> None:
+    """Jolpica uses "Lapped" from 2023 where Ergast said "+1 Lap".
+
+    Both mean the driver took the flag one or more laps down.  Treating the
+    newer spelling as a retirement moved 297 rows into the positive class and
+    pushed the observed DNF rate from ~14% to ~23%.
+    """
+    assert classify_status(status) == FINISHED
+
+
+def test_both_spellings_of_a_lapped_finish_agree() -> None:
+    assert classify_status("Lapped") == classify_status("+1 Lap") == FINISHED
+
+
+def test_retired_is_still_a_retirement() -> None:
+    """Guard the boundary: only the exact word is a finish."""
+    assert classify_status("Retired") == OTHER
+    assert classify_status("Lapped out") != FINISHED

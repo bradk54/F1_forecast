@@ -11,8 +11,8 @@ import pytest
 from src import config
 from src.data.generate_dataset import (
     build_dataset,
-    main,
     join_circuit_profiles,
+    main,
     parse_seasons,
     prepare_circuit_profiles,
     status_coverage,
@@ -119,6 +119,60 @@ def test_build_without_profiles_still_works(raw_results) -> None:
     dataset, _ = build_dataset(raw_results, None, run_checks=False)
     assert len(dataset) > 0
     assert "track_speed_index" not in dataset.columns
+
+
+# --------------------------------------------------------------------------- #
+# Repeat visits to one circuit in a single season
+# --------------------------------------------------------------------------- #
+
+
+def test_repeat_visits_collapse_to_one_profile_per_circuit_season() -> None:
+    """2020 ran two rounds at Silverstone and two at the Red Bull Ring.
+
+    Each round yields its own reference lap, so ``(circuit_key, year)`` gains a
+    duplicate and the profile join -- which is declared ``many_to_one`` -- fails
+    outright.  The two rows describe one layout measured twice.
+    """
+    from src.data.generate_dataset import collapse_repeat_visits
+
+    profiles = pd.DataFrame(
+        {
+            "circuit_key": [2, 2, 19, 7],
+            "year": [2020, 2020, 2020, 2020],
+            "circuit_name": ["Silverstone", "Silverstone", "Spielberg", "Monza"],
+            "event_name": ["British GP", "70th Anniversary GP",
+                           "Austrian GP", "Italian GP"],
+            "lap_length_m": [5830.0, 5840.0, 4310.0, 5790.0],
+            "lat_g_mean": [2.0, 3.0, 1.5, 2.5],
+        }
+    )
+    out = collapse_repeat_visits(profiles)
+
+    assert len(out) == 3
+    assert not out.duplicated(["circuit_key", "year"]).any()
+    assert list(out.columns) == list(profiles.columns)
+
+    silverstone = out.loc[out["circuit_key"] == 2].iloc[0]
+    # Median, not first-wins: the pair is two measurements of one track.
+    assert silverstone["lap_length_m"] == 5835.0
+    assert silverstone["lat_g_mean"] == 2.5
+    # Untouched circuits keep their exact values.
+    monza = out.loc[out["circuit_key"] == 7].iloc[0]
+    assert monza["lap_length_m"] == 5790.0
+
+
+def test_collapse_is_a_no_op_without_repeats() -> None:
+    from src.data.generate_dataset import collapse_repeat_visits
+
+    profiles = pd.DataFrame(
+        {
+            "circuit_key": [2, 2, 19],
+            "year": [2020, 2021, 2020],
+            "lap_length_m": [5830.0, 5840.0, 4310.0],
+        }
+    )
+    out = collapse_repeat_visits(profiles)
+    pd.testing.assert_frame_equal(out, profiles)
 
 
 # --------------------------------------------------------------------------- #

@@ -93,9 +93,16 @@ CAUSE_ORDER = (
 
 #: Statuses that mean the driver reached the end of the race.  ``+ N Lap(s)``
 #: is a classified finish one or more laps down, not a retirement.
+#:
+#: ``Lapped`` is the same thing under a newer name: the Jolpica backend uses it
+#: from 2023 onward alongside the older ``+ N Lap`` form.  Those rows carry a
+#: finishing ``Position``, a matching ``ClassifiedPosition`` and near-full lap
+#: counts, so filing them as retirements overstates the DNF rate by around
+#: seven points.
 _FINISHED_PATTERNS = (
     re.compile(r"^finished$", re.I),
     re.compile(r"^\+\s*\d+\s+laps?$", re.I),
+    re.compile(r"^lapped$", re.I),
 )
 
 #: Ordered (pattern, cause) rules.  The first match wins, so more specific
