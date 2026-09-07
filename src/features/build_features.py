@@ -415,6 +415,108 @@ def add_teammate_comparison(
     return out
 
 
+def prior_ewma(
+    frame: pd.DataFrame,
+    group: str | Sequence[str],
+    value: str,
+    *,
+    halflife: float = 3.0,
+) -> pd.Series:
+    """Exponentially weighted mean over prior races, recent races weighted most.
+
+    A flat 5-race window says the race five weekends ago matters exactly as much
+    as last Sunday's and the one before that matters not at all.  Neither is
+    true: a car that broke last weekend is a different proposition from one that
+    broke in March.  The half-life is in races, so ``halflife=3`` gives the most
+    recent race roughly four times the weight of one six races back.
+
+    Like every builder here the ``shift(1)`` comes first, so the current race
+    never contributes to its own feature.
+    """
+    ordered = _sorted(frame)
+    grouped = ordered.groupby(list(np.atleast_1d(group)), observed=True)[value]
+    ewm = grouped.transform(
+        lambda s: s.shift(1).ewm(halflife=halflife, min_periods=1).mean()
+    )
+    return ewm.reindex(frame.index)
+
+
+def add_recency_features(
+    frame: pd.DataFrame,
+    *,
+    driver_col: str = "DriverId",
+    team_col: str = "TeamId",
+) -> pd.DataFrame:
+    """Short-window and recency-weighted views of retirement risk.
+
+    The rest of the history builders use 5-, 10- and career windows, which
+    describe a settled average.  Attrition is not settled: it moves with
+    regulation changes, with a development war that pushes cars past their
+    reliability margin, and with whatever the last few weekends happened to
+    throw up.  A model that reads the last three races differently from the last
+    thirty has a shot at tracking that; one built only on long windows cannot.
+
+    The field-level rate is the important one and the cheapest to overlook.  It
+    is the grid's own recent attrition -- one number per race, shared by every
+    driver in it -- and it carries the regime that no per-driver window can see.
+    """
+    out = frame.copy()
+    keys = race_keys(out)
+
+    # ---- field-level: the grid's recent attrition, one value per race -------
+    race_rate = (
+        _sorted(out)
+        .groupby([*keys, ORDER_COL], observed=True)
+        .agg(race_dnf_rate=("dnf", "mean"))
+        .reset_index()
+    )
+    # A constant group turns the per-entity helpers into a global rolling view.
+    race_rate["_all"] = 0
+    for window in (3, 5, 10):
+        race_rate[f"field_dnf_rate_last_{window}"] = prior_rolling(
+            race_rate, "_all", "race_dnf_rate", window
+        )
+    race_rate["field_dnf_rate_ewma"] = prior_ewma(
+        race_rate, "_all", "race_dnf_rate", halflife=3.0
+    )
+    join = [c for c in race_rate.columns if c.startswith("field_dnf_rate_")]
+    out = out.merge(
+        race_rate[[*keys, *join]], on=keys, how="left", validate="many_to_one"
+    )
+
+    # ---- entity-level: shorter windows than the builders above -------------
+    out["driver_dnf_rate_3"] = prior_rolling(out, driver_col, "dnf", 3)
+    out["driver_dnf_ewma"] = prior_ewma(out, driver_col, "dnf", halflife=3.0)
+
+    team_race = (
+        _sorted(out)
+        .groupby([team_col, *keys, ORDER_COL], observed=True)
+        .agg(team_dnf_share=("dnf", "mean"))
+        .reset_index()
+    )
+    team_race["team_dnf_rate_3"] = prior_rolling(
+        team_race, team_col, "team_dnf_share", 3
+    )
+    team_race["team_dnf_ewma"] = prior_ewma(
+        team_race, team_col, "team_dnf_share", halflife=3.0
+    )
+    # team_dnf_share describes the current race and stays behind.
+    out = out.merge(
+        team_race[[team_col, *keys, "team_dnf_rate_3", "team_dnf_ewma"]],
+        on=[team_col, *keys],
+        how="left",
+        validate="many_to_one",
+    )
+
+    # Season-to-date, which resets at the winter break.  A new car is a new
+    # reliability question, and carrying December's rate into March denies that.
+    if "Year" in out.columns:
+        out["driver_dnf_rate_season"] = prior_expanding(
+            out, [driver_col, "Year"], "dnf"
+        )
+    return out
+
+
 def add_field_context(frame: pd.DataFrame) -> pd.DataFrame:
     """Properties of the whole grid, assembled from features already built.
 
@@ -642,6 +744,7 @@ def build_history_features(
         )
     frame = add_race_context(frame)
     frame = add_teammate_comparison(frame, team_col=team_col, driver_col=driver_col)
+    frame = add_recency_features(frame, driver_col=driver_col, team_col=team_col)
     # Last: reads the rolling columns the builders above produced.
     frame = add_field_context(frame)
     return frame

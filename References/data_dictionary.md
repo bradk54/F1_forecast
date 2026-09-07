@@ -45,7 +45,7 @@ and every earlier one.
 > retirement risk weather explains.
 
 
-## `pre_weekend` features (90)
+## `pre_weekend` features (99)
 
 | feature | kind | description |
 | --- | --- | --- |
@@ -134,6 +134,15 @@ and every earlier one.
 | `field_size` | numeric | Cars taking the start. |
 | `days_since_last_race` | numeric | Days since this driver's previous race. |
 | `regulation_era` | categorical | Technical-regulation era; 2022 onward is the ground-effect ruleset. |
+| `field_dnf_rate_last_3` | numeric | Mean retirement rate across the whole grid over the previous 3 races. |
+| `field_dnf_rate_last_5` | numeric | Mean retirement rate across the whole grid over the previous 5 races. One number per race, shared by every driver in it. |
+| `field_dnf_rate_last_10` | numeric | Mean retirement rate across the whole grid over the previous 10 races. |
+| `field_dnf_rate_ewma` | numeric | Exponentially weighted grid retirement rate, 3-race half-life, so last weekend counts for roughly four times a race six weekends ago. |
+| `driver_dnf_rate_3` | numeric | Driver's retirement rate over their previous 3 races. |
+| `driver_dnf_ewma` | numeric | Exponentially weighted driver retirement rate, 3-race half-life. |
+| `driver_dnf_rate_season` | numeric | Driver's retirement rate so far this season only.  Resets at the winter break: a new car is a new reliability question. |
+| `team_dnf_rate_3` | numeric | Team's retirement rate over its previous 3 races. |
+| `team_dnf_ewma` | numeric | Exponentially weighted team retirement rate, 3-race half-life. |
 | `field_dnf_rate_mean` | numeric | Mean of every starter's driver_dnf_rate_10 for this race: how fragile this particular field is on recent form. |
 | `driver_dnf_rate_vs_field` | numeric | Driver's 10-race retirement rate minus the field mean; a 20% rate means something different on a fragile grid than on a robust one. |
 | `field_pace_spread` | numeric | Standard deviation of team_points_rate_5 across the grid.  A compressed field races closer together, which is where contact comes from. |

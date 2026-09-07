@@ -74,13 +74,31 @@ Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Interme
 - **The registry is authoritative.** Every feature is declared in `src/features/registry.py` with a `Stage` saying when it becomes knowable. Add features there, not ad hoc — `audit_coverage` fails the build for anything in the dataset but not registered.
 - **Leakage is checked, not assumed.** `detect_target_leakage` runs before every write and `main()` returns exit 3 if it fires. Rolling features must be strictly prior-race; the helpers in `build_features.py` (`prior_rolling`, `prior_expanding`) exist for this.
 - **A load can succeed and still be useless.** `Status` comes from the Ergast backend, not F1 timing, and `Session.load` swallows an Ergast failure — a rate-limited round returns a full grid with a blank `Status`, which the labeller would read as an all-retirement race. `extract_results` rejects that (`DegradedResultsError`); `status_coverage` is the dataset-level backstop and `main()` returns exit 4 rather than writing. Prefer `--offline` when the cache is warm; it is faster and cannot provoke a 429.
-- **Cause labels stop in 2023.** The Jolpica backend returns a bare `Retired`
-  for every retirement from 2023 on, so `dnf_cause`, `dnf_mechanical` and
-  `dnf_incident` are only populated for 2018-2022; `dnf` itself stays valid
-  throughout. Cause-specific modelling is therefore confined to four
-  walk-forward folds and roughly 120 events per cause, which is not enough to
-  resolve an effect — measured, not assumed. This is upstream data loss, not a
-  gap in `_CAUSE_RULES`.
+- **`dnf` is the modelling target. Do not split it by cause.** This was tried
+  and measured, and it does not work: the Jolpica backend returns a bare
+  `Retired` for every retirement from 2023 on, so `dnf_cause`,
+  `dnf_mechanical`, `dnf_incident` and `dnf_other` are only populated for
+  2018-2022, while `dnf` stays valid throughout. That confines cause work to
+  four walk-forward folds and ~120 events per cause, where every confidence
+  interval crosses zero — against the base rate and against the combined `dnf`
+  model alike. The seasons with deep training history are exactly the ones with
+  no causes at all. The cause columns are kept as diagnostics for 2018-2022 and
+  are listed in `NON_FEATURE_COLUMNS`; treat them as descriptive, not as
+  targets. Reopening this needs cause labels from a second source, not more
+  modelling.
+- **Recency beats depth, and the mechanism is the training window — not the
+  features.** `walk_forward_races` refits before every race, which is how the
+  model is actually run: retrained the moment the last race is classified.
+  `walk_forward_evaluate` refits once a season and is the coarser view, giving
+  the first race of a season the same stale model as the last. Attrition is not
+  stationary — 19.5% (2018), 10.3% (2024), 19.7% (2026 under the new power
+  units) — and on 2026 held out, a **sliding `lookback_races=40` window beat the
+  expanding window on every metric**: Brier skill +0.021 → +0.049, calibration
+  slope 0.59 → 0.75, and it is the only configuration whose Brier improvement
+  over the base rate clears zero. Roughly 40-60 races (2-3 seasons) is the
+  measured sweet spot; the full nine-season history is actively harmful.
+  The short-window and EWMA *features* are, by contrast, close to neutral —
+  keep them, but do not credit them for this.
 - **Sprints inform history but are not modelling rows.** A 100 km sprint and a 305 km grand prix do not share an attrition process.
 - **Exit codes:** 1 no data / unreachable, 2 missing cached intermediates, 3 leakage, 4 a race with no finishing status.
 

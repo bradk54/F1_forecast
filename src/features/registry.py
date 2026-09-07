@@ -262,6 +262,33 @@ FEATURES: tuple[Feature, ...] = (
        "Technical-regulation era; 2022 onward is the ground-effect ruleset.",
        allows_cold_start_nan=False),
 
+    # ---- recency (pre-weekend) --------------------------------------------
+    # The windows above describe a settled average.  Attrition is not settled:
+    # it moves with regulation changes and with whatever the last few weekends
+    # threw up.  These track that, and the field-level rate carries a regime
+    # no per-driver window can see.
+    _f("field_dnf_rate_last_3", "pre_weekend", "numeric",
+       "Mean retirement rate across the whole grid over the previous 3 races."),
+    _f("field_dnf_rate_last_5", "pre_weekend", "numeric",
+       "Mean retirement rate across the whole grid over the previous 5 races. "
+       "One number per race, shared by every driver in it."),
+    _f("field_dnf_rate_last_10", "pre_weekend", "numeric",
+       "Mean retirement rate across the whole grid over the previous 10 races."),
+    _f("field_dnf_rate_ewma", "pre_weekend", "numeric",
+       "Exponentially weighted grid retirement rate, 3-race half-life, so last "
+       "weekend counts for roughly four times a race six weekends ago."),
+    _f("driver_dnf_rate_3", "pre_weekend", "numeric",
+       "Driver's retirement rate over their previous 3 races."),
+    _f("driver_dnf_ewma", "pre_weekend", "numeric",
+       "Exponentially weighted driver retirement rate, 3-race half-life."),
+    _f("driver_dnf_rate_season", "pre_weekend", "numeric",
+       "Driver's retirement rate so far this season only.  Resets at the "
+       "winter break: a new car is a new reliability question."),
+    _f("team_dnf_rate_3", "pre_weekend", "numeric",
+       "Team's retirement rate over its previous 3 races."),
+    _f("team_dnf_ewma", "pre_weekend", "numeric",
+       "Exponentially weighted team retirement rate, 3-race half-life."),
+
     # ---- field composition (pre-weekend) ----------------------------------
     # Attrition is partly a property of the grid rather than of any one car.
     _f("field_dnf_rate_mean", "pre_weekend", "numeric",

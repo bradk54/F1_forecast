@@ -54,7 +54,11 @@ DNF_DATASET_PATH = PROCESSED_DIR / "dnf_dataset.parquet"
 # track-speed features this project depends on need telemetry, so 2018 is the
 # floor for the modelling window.
 FIRST_TELEMETRY_SEASON = 2018
-DEFAULT_SEASONS = tuple(range(FIRST_TELEMETRY_SEASON, 2026))
+#: Upper bound is exclusive and needs bumping each January.  A season still in
+#: progress is worth including: its completed rounds are ordinary training rows,
+#: and the rounds that have not run yet simply produce no results to collect.
+LATEST_SEASON = 2027
+DEFAULT_SEASONS = tuple(range(FIRST_TELEMETRY_SEASON, LATEST_SEASON))
 
 # Formula 1's technical regulations changed materially in 2022 (ground-effect
 # aerodynamics, 18-inch wheels).  Reliability and crash dynamics differ enough
@@ -62,6 +66,11 @@ DEFAULT_SEASONS = tuple(range(FIRST_TELEMETRY_SEASON, 2026))
 REGULATION_ERAS = {
     "hybrid_v2": range(2017, 2022),      # 2017-2021 wide-body cars
     "ground_effect": range(2022, 2026),  # 2022-2025
+    # 2026 is a bigger break than 2022: new power units with a far larger
+    # electrical share, active aerodynamics and lighter cars.  A first-year
+    # formula is exactly when reliability is worst, so the era label matters
+    # more here than in a settled season.
+    "hybrid_v3": range(2026, 2031),
 }
 
 # --------------------------------------------------------------------------- #

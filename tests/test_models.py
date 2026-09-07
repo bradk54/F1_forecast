@@ -17,6 +17,7 @@ from src.models.train import (
     race_bootstrap,
     score_predictions,
     walk_forward_evaluate,
+    walk_forward_races,
 )
 
 
@@ -155,3 +156,86 @@ def test_race_bootstrap_resamples_whole_races(modelling_dataset) -> None:
 def test_missing_target_raises(modelling_dataset) -> None:
     with pytest.raises(KeyError, match="target"):
         walk_forward_evaluate(modelling_dataset, target="not_a_column")
+
+
+# --------------------------------------------------------------------------- #
+# Race-by-race retraining
+# --------------------------------------------------------------------------- #
+#
+# The operational cadence: refit the moment the last race is classified, so
+# every race is scored by a model that has seen every race before it and none
+# after. A season-level split cannot express that, and flatters early rounds.
+
+
+def test_race_walk_forward_never_trains_on_the_future(modelling_dataset) -> None:
+    result = walk_forward_races(modelling_dataset, model="logistic")
+    assert not result.predictions.empty
+    # Every scored race must have been preceded by the rows it trained on.
+    races = (
+        modelling_dataset[["Year", "RoundNumber", "RaceDate"]]
+        .drop_duplicates()
+        .sort_values("RaceDate")
+    )
+    order = {(r.Year, r.RoundNumber): i for i, r in enumerate(races.itertuples())}
+    for row in result.predictions.itertuples():
+        # A race can only be scored once history exists before it.
+        assert order[(row.Year, row.RoundNumber)] > 0
+
+
+def test_every_scored_race_is_scored_exactly_once(modelling_dataset) -> None:
+    result = walk_forward_races(modelling_dataset, model="logistic")
+    counts = result.predictions.groupby(
+        ["Year", "RoundNumber", "DriverId"], observed=True
+    ).size()
+    assert counts.max() == 1
+
+
+def test_training_set_grows_with_every_race(modelling_dataset) -> None:
+    """The expanding window must actually expand."""
+    result = walk_forward_races(modelling_dataset, model="logistic")
+    per_race = (
+        result.predictions.groupby(["Year", "RoundNumber"], observed=True)["train_rows"]
+        .first()
+        .sort_index()
+    )
+    assert per_race.is_monotonic_increasing
+    assert per_race.iloc[-1] > per_race.iloc[0]
+
+
+def test_lookback_caps_the_training_window(modelling_dataset) -> None:
+    """A sliding window must stop growing once it is full."""
+    # min_train_rows has to come down with the window, or nothing is scored.
+    result = walk_forward_races(
+        modelling_dataset, model="logistic", lookback_races=5, min_train_rows=50
+    )
+    assert not result.predictions.empty
+    train_rows = result.predictions["train_rows"]
+    full = walk_forward_races(modelling_dataset, model="logistic", min_train_rows=50)
+    assert train_rows.max() < full.predictions["train_rows"].max()
+    # Five races of a fixed-size field is a bounded number of rows.
+    per_race = modelling_dataset.groupby(
+        ["Year", "RoundNumber"], observed=True
+    ).size().max()
+    assert train_rows.max() <= 5 * per_race
+
+
+def test_refit_every_reduces_the_number_of_fits(modelling_dataset) -> None:
+    """Refitting less often must reuse a model across races, not silently refit."""
+    often = walk_forward_races(modelling_dataset, model="logistic", refit_every=1)
+    rarely = walk_forward_races(modelling_dataset, model="logistic", refit_every=5)
+    assert rarely.predictions["train_rows"].nunique() < often.predictions[
+        "train_rows"
+    ].nunique()
+
+
+def test_race_walk_forward_reports_per_season_scores(modelling_dataset) -> None:
+    result = walk_forward_races(modelling_dataset, model="logistic")
+    assert not result.scores.empty
+    assert "season" in result.scores.columns
+    assert result.predictions["predicted"].between(0, 1).all()
+
+
+def test_start_after_skips_early_races(modelling_dataset) -> None:
+    cutoff = modelling_dataset["RaceDate"].quantile(0.5)
+    result = walk_forward_races(modelling_dataset, model="logistic", start_after=cutoff)
+    assert (result.predictions["RaceDate"] > cutoff).all()
