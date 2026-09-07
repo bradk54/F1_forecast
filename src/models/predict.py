@@ -405,7 +405,9 @@ def cmd_refresh(args) -> int:
 def _predict_event(args, event: dict) -> int:
     dataset = load_dataset()
     expected = registry.feature_columns(args.stage, available=dataset.columns)
-    estimator, manifest = store.load_model(dataset, expected_features=expected)
+    estimator, manifest = store.load_model(
+        dataset, expected_features=expected, expected_stage=args.stage
+    )
 
     grid = None
     if args.stage == "post_quali" and not args.no_grid:
@@ -587,6 +589,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.lookback = None
     try:
         return args.func(args)
+    except store.StageMismatchError as exc:
+        print(f"error: {exc}")
+        return 4
     except (store.ModelStoreError, FileNotFoundError) as exc:
         print(f"error: {exc}")
         return 2

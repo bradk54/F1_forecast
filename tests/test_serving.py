@@ -107,6 +107,63 @@ def test_schema_drift_is_refused(store_paths, modelling_dataset) -> None:
         )
 
 
+def test_a_stage_mismatch_is_not_reported_as_drift(
+    store_paths, modelling_dataset
+) -> None:
+    """A pre-weekend model asked for post-quali differs by exactly the grid columns.
+
+    That reads as "six features were added since this was fitted", which sends
+    people looking for a registry change that never happened.
+    """
+    estimator, manifest, _ = fit_current(
+        modelling_dataset, model="logistic", stage="pre_weekend"
+    )
+    store.save_model(estimator, manifest)
+    expected = registry.feature_columns(
+        "post_quali", available=modelling_dataset.columns
+    )
+
+    with pytest.raises(store.StageMismatchError) as excinfo:
+        store.load_model(
+            modelling_dataset,
+            expected_features=expected,
+            expected_stage="post_quali",
+        )
+    message = str(excinfo.value)
+    assert "pre_weekend" in message and "post_quali" in message
+    assert "--stage post_quali" in message, "must say how to fix it"
+    assert "different models" in message
+
+
+def test_the_matching_stage_loads(store_paths, modelling_dataset) -> None:
+    estimator, manifest, selected = fit_current(
+        modelling_dataset, model="logistic", stage="pre_weekend"
+    )
+    store.save_model(estimator, manifest)
+    loaded, _ = store.load_model(
+        modelling_dataset, expected_features=selected, expected_stage="pre_weekend"
+    )
+    assert loaded is not None
+
+
+def test_a_different_sklearn_warns_but_does_not_refuse(
+    store_paths, modelling_dataset, caplog
+) -> None:
+    """A patch bump usually still scores correctly; blocking would be worse."""
+    estimator, manifest, selected = fit_current(modelling_dataset, model="logistic")
+    manifest.sklearn_version = "0.0.1-from-the-past"
+    store.save_model(estimator, manifest)
+    # save_model stamps the real version, so put the fake one back on disk.
+    data = json.loads(store.MANIFEST_PATH.read_text())
+    data["sklearn_version"] = "0.0.1-from-the-past"
+    store.MANIFEST_PATH.write_text(json.dumps(data))
+
+    with caplog.at_level("WARNING", logger="src.models.store"):
+        loaded, _ = store.load_model(modelling_dataset, expected_features=selected)
+    assert loaded is not None, "a version difference must not block a prediction"
+    assert "scikit-learn" in caplog.text and "refresh" in caplog.text
+
+
 def test_manifest_is_readable_json(store_paths, modelling_dataset) -> None:
     """A person should be able to answer "what is deployed" with `cat`."""
     estimator, manifest, _ = fit_current(modelling_dataset, model="logistic")
