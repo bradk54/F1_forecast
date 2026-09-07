@@ -77,14 +77,6 @@ def test_score_predictions_handles_a_single_class() -> None:
     assert not np.isnan(scores["brier"])
 
 
-@pytest.fixture(scope="module")
-def modelling_dataset(raw_results, circuit_profiles):
-    from src.data.generate_dataset import build_dataset
-
-    dataset, _ = build_dataset(raw_results, circuit_profiles, run_checks=False)
-    return dataset
-
-
 def test_walk_forward_never_trains_on_the_future(modelling_dataset) -> None:
     result = walk_forward_evaluate(modelling_dataset, stage="post_quali")
     assert not result.scores.empty

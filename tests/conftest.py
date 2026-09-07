@@ -62,6 +62,15 @@ def labelled_results(raw_results: pd.DataFrame) -> pd.DataFrame:
 
 
 @pytest.fixture(scope="session")
+def modelling_dataset(raw_results, circuit_profiles) -> pd.DataFrame:
+    """The built modelling table, as the model and serving code both see it."""
+    from src.data.generate_dataset import build_dataset
+
+    dataset, _ = build_dataset(raw_results, circuit_profiles, run_checks=False)
+    return dataset
+
+
+@pytest.fixture(scope="session")
 def circuit_profiles() -> pd.DataFrame:
     """A profile per circuit per season, with one deliberately withheld."""
     from src.features.track_profile import build_lap_profile
