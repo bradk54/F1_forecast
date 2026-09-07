@@ -298,6 +298,12 @@ def cli(tmp_path, monkeypatch, circuit_profiles):
 
     monkeypatch.setattr(config, "RACE_RESULTS_PATH", results_path)
     monkeypatch.setattr(config, "CIRCUIT_PROFILE_PATH", profiles_path)
+    # DNF_DATASET_PATH too, and not only for symmetry: the tests below call
+    # ``main`` without ``--out`` to exercise the default write path, and the
+    # default is the developer's real dataset.  Leaving it unpatched means a
+    # plain ``pytest`` silently replaces a 3,700-row modelling table with a
+    # 490-row synthetic fixture, which looks like a successful run.
+    monkeypatch.setattr(config, "DNF_DATASET_PATH", tmp_path / "default_dnf.parquet")
     monkeypatch.setattr(config, "ensure_dirs", lambda: None)
     circuit_profiles.to_parquet(profiles_path, index=False)
 
