@@ -380,12 +380,18 @@ def cmd_refresh(args) -> int:
                     lookback_races=old.lookback_races,
                 )
                 monitor.append_row(row)
+                filled = monitor.record_outcomes(
+                    actual[["DriverId", TARGET]],
+                    year=row["year"], round_number=row["round"],
+                )
                 print(
                     f"scored {row['year']} R{row['round']} {row['event']}: "
                     f"observed {row['observed_rate']:.3f}, "
                     f"brier skill {row['brier_skill']:+.4f}, "
                     f"top-2 caught {row['top2_hits']}/2"
                 )
+                if filled:
+                    print(f"  filled outcomes for {filled} recorded prediction(s)")
                 store.clear_pending()
 
     estimator, manifest, _ = fit_current(
@@ -479,8 +485,19 @@ def _predict_event(args, event: dict) -> int:
 
     if not args.no_save:
         keep = ["Year", "RoundNumber", "DriverId", "TeamId", "predicted"]
+        if "grid_position" in rows.columns:
+            keep.append("grid_position")
         store.save_pending(rows[keep], manifest)
-        print(f"  prediction saved for scoring at the next refresh")
+        monitor.append_predictions(
+            rows, manifest,
+            year=event["year"], round_number=event["round_number"],
+            event=event["event_name"], race_date=event["race_date"],
+        )
+        print(
+            f"  saved: {len(rows)} predictions to "
+            f"{monitor.PREDICTIONS_PATH.relative_to(config.REPO_ROOT)}, "
+            f"and queued for scoring at the next refresh"
+        )
     return 0
 
 
@@ -528,6 +545,14 @@ def cmd_status(args) -> int:
     print(frame.tail(args.window)[columns].to_string(index=False))
     print(f"\n=== rolling over last {args.window} ===")
     print(monitor.rolling_summary(args.window).to_string())
+    predictions = monitor.read_predictions()
+    if not predictions.empty:
+        unscored = predictions.loc[predictions["dnf"].isna()]
+        print(
+            f"\npredictions recorded: {len(predictions)} rows across "
+            f"{predictions.groupby(['year', 'round']).ngroups} race(s)"
+            + (f", {len(unscored)} awaiting a result" if len(unscored) else "")
+        )
     try:
         print(f"\ncurrent model: {store.read_manifest().describe()}")
     except store.ModelStoreError as exc:
