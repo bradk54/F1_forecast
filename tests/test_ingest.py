@@ -271,6 +271,7 @@ def make_session(
     drop_status: bool = False,
     round_number: int = 8,
     event_name: str = "Monaco Grand Prix",
+    year: int = 2024,
 ):
     """A stand-in for a loaded FastF1 session, carrying the columns we read.
 
@@ -302,7 +303,7 @@ def make_session(
     session.results = results
     session.event = pd.Series(
         {
-            "EventDate": pd.Timestamp("2024-05-26"),
+            "EventDate": pd.Timestamp(f"{year}-05-26"),
             "RoundNumber": round_number,
             "EventName": event_name,
             "Location": "Monte-Carlo",
@@ -567,3 +568,61 @@ def test_load_session_passes_the_load_flags_through(monkeypatch, no_sleep) -> No
     assert session.load_kwargs == {
         "laps": False, "telemetry": False, "weather": True, "messages": False,
     }
+
+
+# --------------------------------------------------------------------------- #
+# A calendar that will not load
+# --------------------------------------------------------------------------- #
+#
+# FastF1 tries three backends for a schedule and raises only when all three
+# fail, which means the network is down or Ergast is rate-limiting. Neither is
+# a season's own fault, and neither should end the run with a traceback.
+
+
+def test_a_failed_schedule_is_reported_not_raised(monkeypatch) -> None:
+    module = types.ModuleType("fastf1")
+
+    def explode(year, include_testing=False):
+        raise ValueError("Failed to load any schedule data.")
+
+    module.get_event_schedule = explode
+    monkeypatch.setitem(sys.modules, "fastf1", module)
+
+    report = IngestReport()
+    frame = ingest.collect_season_results(2024, report=report)
+
+    assert frame.empty
+    assert len(report.failed) == 1
+    label, message = report.failed[0]
+    assert label == "2024 schedule"
+    assert "Failed to load any schedule data" in message
+
+
+def test_one_bad_season_does_not_stop_the_others(monkeypatch) -> None:
+    """A rate limit that clears mid-run must not cost the remaining seasons."""
+    schedule = pd.DataFrame(
+        {"RoundNumber": list(EVENT_NAMES), "EventName": list(EVENT_NAMES.values())}
+    )
+    module = types.ModuleType("fastf1")
+
+    def sometimes(year, include_testing=False):
+        if year == 2024:
+            raise ValueError("Failed to load any schedule data.")
+        return schedule
+
+    module.get_event_schedule = sometimes
+    monkeypatch.setitem(sys.modules, "fastf1", module)
+    monkeypatch.setattr(
+        ingest, "load_session",
+        lambda year, event, session_type, **kw: make_session(
+            GOOD_STATUS, round_number=event, event_name=EVENT_NAMES[event],
+            year=year,
+        ),
+    )
+    monkeypatch.setattr(ingest, "extract_weather", lambda session: {})
+
+    frame, report = ingest.collect_results([2024, 2025])
+
+    assert not frame.empty, "2025 should still have been collected"
+    assert set(frame["Year"]) == {2025}
+    assert any(label == "2024 schedule" for label, _ in report.failed)

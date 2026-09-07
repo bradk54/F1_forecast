@@ -429,7 +429,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             log.error("%s", exc)
             return 1
         if results.empty:
-            log.error("no results collected; nothing to build")
+            # Every season failed.  Almost always the network or an Ergast rate
+            # limit rather than anything about the data, so say what to do next
+            # instead of only that nothing came back.
+            log.error(
+                "no results collected; nothing to build.\n"
+                "  Every season failed to load. The usual causes are a rate "
+                "limit (Ergast allows 500 calls/hour) or no network.\n"
+                "  If the FastF1 cache is populated, rebuild from it without "
+                "touching the network:\n"
+                "    python -m src.data.generate_dataset --offline\n"
+                "  Check F1_FASTF1_CACHE points at the cache you actually have."
+            )
             return 1
         _write(results, config.RACE_RESULTS_PATH, "results")
         if not profiles.empty:
