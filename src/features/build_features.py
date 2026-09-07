@@ -584,6 +584,17 @@ def add_cause_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     out["dnf_incident"] = (
         cause.isin([COLLISION, DRIVER_ERROR]) & (out["dnf"] == 1)
     ).astype("int8")
+    # The remainder, and it is not small: roughly a third of retirements in a
+    # 2018-2025 pull carry the bare status ``Retired``, which states that the
+    # car stopped and nothing else.  Naming the bucket keeps it visible --
+    # mechanical and incident together do not add up to ``dnf``, and a
+    # cause-specific model that ignores this would be silently modelling two
+    # thirds of the target.
+    out["dnf_other"] = (
+        (out["dnf"] == 1)
+        & (out["dnf_mechanical"] == 0)
+        & (out["dnf_incident"] == 0)
+    ).astype("int8")
     return out
 
 
@@ -647,6 +658,7 @@ OUTCOME_COLUMNS = frozenset(
         "dnf", "dnf_cause", "dnf_strict", "dnf_classified", "finished_on_track",
         "classified", "classification_code", "started", "Status", "Position",
         "ClassifiedPosition", "Points", "Laps", "dnf_mechanical", "dnf_incident",
+        "dnf_other",
     }
 )
 

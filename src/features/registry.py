@@ -384,6 +384,7 @@ NON_FEATURE_COLUMNS = frozenset(
     {
         # targets and outcome descriptions
         "dnf", "dnf_strict", "dnf_classified", "dnf_mechanical", "dnf_incident",
+        "dnf_other",
         "finished_on_track", "classified", "started",
         # raw result fields, superseded by cleaned features
         "Position", "GridPosition", "Points", "Laps", "DriverNumber",

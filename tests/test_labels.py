@@ -75,6 +75,24 @@ def test_status_mapping(status: str, expected: str) -> None:
     assert classify_status(status) == expected
 
 
+@pytest.mark.parametrize(
+    "status", ["Power loss", "Loss of power", "power  loss", "Power Unit"]
+)
+def test_power_loss_is_mechanical(status: str) -> None:
+    """Jolpica returns "Power loss" when it does not name the component.
+
+    It reached the ``other`` bucket for 8 rows of a 2018-2025 pull, which is
+    what ``unmapped_statuses`` is there to surface.
+    """
+    assert classify_status(status) == MECHANICAL
+
+
+@pytest.mark.parametrize("status", ["Powerless", "Power", "Horsepower"])
+def test_power_alone_is_not_a_cause(status: str) -> None:
+    """The rule must not swallow any word containing "power"."""
+    assert classify_status(status) == OTHER
+
+
 def test_retired_is_not_mechanical() -> None:
     """Regression: an unanchored ``tire`` pattern matches "Re-tire-d".
 
