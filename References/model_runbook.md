@@ -3,7 +3,14 @@
 How to run the retirement model week to week: what the commands do, what the
 model assumes, and what to do when something breaks.
 
-Everything here uses `./.venv/bin/python` from the repository root.
+**Run everything with `./.venv/bin/python` from the repository root.** Not
+`python`, not a conda environment. The CLI needs `fastf1`, which only the venv
+has, and the saved model is pickled by the venv's scikit-learn — running it
+elsewhere gets you `ModuleNotFoundError: No module named 'fastf1'` in one env
+and a wall of `InconsistentVersionWarning` in another.
+
+The notebooks are the exception: they run under the `data_science` conda
+environment and read the parquet files rather than importing `src/`.
 
 ---
 
@@ -272,6 +279,30 @@ have caught it.
 ---
 
 ## When things break
+
+### `ModuleNotFoundError: No module named 'fastf1'`
+
+You are not in the venv. Every command in this file starts with
+`./.venv/bin/python`, and a bare `python` picks up whatever conda has activated.
+
+### `error: the saved model was fitted at stage 'pre_weekend', but 'post_quali' was requested`
+
+`refresh` fits **one** model, at whichever `--stage` it was given. Either refit
+at the stage you want, or ask for the one that exists — the message names both
+commands. This is not drift, and refitting "to fix drift" will not help if you
+refit at the same wrong stage.
+
+### `InconsistentVersionWarning: Trying to unpickle estimator ... from version X when using version Y`
+
+The model was pickled by a different scikit-learn than the one reading it —
+almost always because the command was run outside the venv. It is a warning,
+not an error, and the estimator usually still scores correctly, but the
+predictions are not guaranteed identical. Run from `./.venv/bin/python`, or
+refit:
+
+```bash
+./.venv/bin/python -m src.models.predict refresh --no-download
+```
 
 ### `error: no model at Models/dnf_model.joblib`
 

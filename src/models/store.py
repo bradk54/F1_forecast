@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,8 @@ from typing import Any, Sequence
 import pandas as pd
 
 from src import config
+
+log = logging.getLogger(__name__)
 
 MODEL_PATH = config.MODELS_DIR / "dnf_model.joblib"
 MANIFEST_PATH = config.MODELS_DIR / "dnf_model.json"
@@ -56,6 +59,17 @@ class StaleModelError(ModelStoreError):
 
 class SchemaDriftError(ModelStoreError):
     """The saved model's features no longer match the dataset's."""
+
+
+class StageMismatchError(ModelStoreError):
+    """The saved model was fitted at a different information stage.
+
+    Kept separate from :class:`SchemaDriftError` because the fix is different
+    and the feature difference looks identical from the outside.  A pre-weekend
+    model asked for a post-quali prediction is missing exactly the grid columns,
+    which reads as "six features were added since this was fitted" and sends
+    people looking for a registry change that never happened.
+    """
 
 
 def dataset_fingerprint(dataset: pd.DataFrame) -> str:
@@ -157,6 +171,7 @@ def load_model(
     *,
     check: bool = True,
     expected_features: Sequence[str] | None = None,
+    expected_stage: str | None = None,
 ):
     """Load the saved estimator and manifest.
 
@@ -167,9 +182,13 @@ def load_model(
             the point is to inspect why.
         expected_features: The registry's current selection.  A mismatch means
             the registry changed under the saved model.
+        expected_stage: The stage being asked for.  Checked before the feature
+            list, because a stage mismatch produces a feature difference that
+            looks like drift and is not.
 
     Raises:
         ModelMissingError: nothing has been fitted.
+        StageMismatchError: the model was fitted at a different stage.
         StaleModelError: ``dataset`` contains races the model never saw.
         SchemaDriftError: ``expected_features`` differs from the saved list.
     """
@@ -185,6 +204,33 @@ def load_model(
 
     if not check:
         return estimator, manifest
+
+    if expected_stage is not None and manifest.stage != expected_stage:
+        raise StageMismatchError(
+            f"the saved model was fitted at stage {manifest.stage!r}, but "
+            f"{expected_stage!r} was requested. These are different models, not "
+            f"the same one with more or less information.\n"
+            f"  Refit at the stage you want:\n"
+            f"    python -m src.models.predict refresh --no-download "
+            f"--stage {expected_stage}\n"
+            f"  Or ask for the stage that is already fitted:\n"
+            f"    python -m src.models.predict <command> --stage {manifest.stage}"
+        )
+
+    # scikit-learn pickles are not guaranteed across versions.  This warns
+    # rather than refuses: the estimator usually still scores correctly, and
+    # blocking a prediction over a patch bump would be worse than saying so.
+    if manifest.sklearn_version:
+        import sklearn
+
+        if sklearn.__version__ != manifest.sklearn_version:
+            log.warning(
+                "the model was pickled by scikit-learn %s and this is %s; "
+                "predictions may differ subtly. Refit with "
+                "'python -m src.models.predict refresh --no-download' to silence "
+                "this.",
+                manifest.sklearn_version, sklearn.__version__,
+            )
 
     if expected_features is not None:
         missing = set(expected_features) - set(manifest.features)
