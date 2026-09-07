@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from src.models.train import (
+    DEFAULT_LOOKBACK_RACES,
     MODEL_FACTORIES,
     calibration_slope,
     race_bootstrap,
@@ -191,8 +192,10 @@ def test_every_scored_race_is_scored_exactly_once(modelling_dataset) -> None:
 
 
 def test_training_set_grows_with_every_race(modelling_dataset) -> None:
-    """The expanding window must actually expand."""
-    result = walk_forward_races(modelling_dataset, model="logistic")
+    """The expanding window must actually expand, when it is asked for."""
+    result = walk_forward_races(
+        modelling_dataset, model="logistic", lookback_races=None
+    )
     per_race = (
         result.predictions.groupby(["Year", "RoundNumber"], observed=True)["train_rows"]
         .first()
@@ -210,7 +213,9 @@ def test_lookback_caps_the_training_window(modelling_dataset) -> None:
     )
     assert not result.predictions.empty
     train_rows = result.predictions["train_rows"]
-    full = walk_forward_races(modelling_dataset, model="logistic", min_train_rows=50)
+    full = walk_forward_races(
+        modelling_dataset, model="logistic", min_train_rows=50, lookback_races=None
+    )
     assert train_rows.max() < full.predictions["train_rows"].max()
     # Five races of a fixed-size field is a bounded number of rows.
     per_race = modelling_dataset.groupby(
@@ -239,3 +244,44 @@ def test_start_after_skips_early_races(modelling_dataset) -> None:
     cutoff = modelling_dataset["RaceDate"].quantile(0.5)
     result = walk_forward_races(modelling_dataset, model="logistic", start_after=cutoff)
     assert (result.predictions["RaceDate"] > cutoff).all()
+
+
+def test_default_is_a_bounded_window(modelling_dataset) -> None:
+    """40 races by default: measured on held-out 2026, not a neutral choice."""
+    assert DEFAULT_LOOKBACK_RACES == 40
+    default = walk_forward_races(modelling_dataset, model="logistic")
+    expanding = walk_forward_races(
+        modelling_dataset, model="logistic", lookback_races=None
+    )
+    assert (
+        default.predictions["train_rows"].max()
+        <= expanding.predictions["train_rows"].max()
+    )
+
+
+def test_lookback_window_is_measured_over_the_full_calendar(
+    modelling_dataset,
+) -> None:
+    """``start_after`` chooses what to score; it must not shrink the window.
+
+    Deriving the lookback from the post-cutoff races gave the first scored race
+    a full history and the next one a single race, so everything after it fell
+    below ``min_train_rows`` and was silently dropped.
+    """
+    cutoff = modelling_dataset["RaceDate"].quantile(0.5)
+    scored = walk_forward_races(
+        modelling_dataset, model="logistic", start_after=cutoff
+    )
+    everything = walk_forward_races(modelling_dataset, model="logistic")
+
+    after_cutoff = everything.predictions.loc[
+        everything.predictions["RaceDate"] > cutoff
+    ]
+    assert len(scored.predictions) == len(after_cutoff)
+    # And each race trains on the same rows either way.
+    pd.testing.assert_series_equal(
+        scored.predictions.sort_values(["Year", "RoundNumber"])["train_rows"]
+        .reset_index(drop=True),
+        after_cutoff.sort_values(["Year", "RoundNumber"])["train_rows"]
+        .reset_index(drop=True),
+    )
