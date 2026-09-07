@@ -36,6 +36,20 @@ from src.models.train import score_predictions
 log = logging.getLogger(__name__)
 
 LOG_PATH = config.REPORTS_DIR / "model_log.csv"
+#: Every prediction ever made, one row per driver per race.  The race-level log
+#: above says how a weekend went; this says what was actually claimed about each
+#: car, which is the only thing that supports a question like "what did we say
+#: about this driver before Barcelona".
+PREDICTIONS_PATH = config.REPORTS_DIR / "predictions.csv"
+
+#: Column order for the per-driver log.  ``dnf`` and ``scored_at`` are blank
+#: until the race runs and a refresh fills them in.
+PREDICTION_COLUMNS = (
+    "predicted_at", "year", "round", "event", "race_date",
+    "stage", "model", "git_sha", "trained_through_round", "train_base_rate",
+    "driver_id", "team_id", "grid_position", "predicted",
+    "dnf", "scored_at",
+)
 
 #: Column order, fixed so the CSV diffs cleanly.
 LOG_COLUMNS = (
@@ -207,3 +221,117 @@ def drift_check(
             f"sport has moved away from; consider re-tuning lookback_races."
         )
     return True, message
+
+
+# --------------------------------------------------------------------------- #
+# Per-driver predictions
+# --------------------------------------------------------------------------- #
+
+
+def append_predictions(
+    rows: pd.DataFrame,
+    manifest,
+    *,
+    year: int,
+    round_number: int,
+    event: str,
+    race_date,
+    path: Path = PREDICTIONS_PATH,
+) -> Path:
+    """Record what was claimed about each car, before the race runs.
+
+    ``dnf`` is left blank and filled by :func:`record_outcomes` afterwards, so a
+    row in this file is written at a point where the answer did not exist.  That
+    is the property that makes it worth keeping: it cannot be quietly revised
+    once the result is known.
+
+    Re-predicting the same race and stage replaces the earlier rows rather than
+    appending a second set -- running the command twice on a Saturday should not
+    leave two contradictory records of the same weekend.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    frame = pd.DataFrame({
+        "predicted_at": now,
+        "year": int(year),
+        "round": int(round_number),
+        "event": event,
+        "race_date": pd.Timestamp(race_date).date().isoformat(),
+        "stage": manifest.stage,
+        "model": manifest.model,
+        "git_sha": manifest.git_sha,
+        "trained_through_round": manifest.trained_through_round,
+        "train_base_rate": round(float(manifest.train_base_rate), 5),
+        "driver_id": rows["DriverId"].to_numpy(),
+        "team_id": rows.get("TeamId", pd.Series([""] * len(rows))).to_numpy(),
+        "grid_position": rows.get(
+            "grid_position", pd.Series([np.nan] * len(rows))
+        ).to_numpy(),
+        "predicted": rows["predicted"].round(5).to_numpy(),
+        "dnf": "",
+        "scored_at": "",
+    })[list(PREDICTION_COLUMNS)]
+
+    if path.exists():
+        existing = pd.read_csv(path)
+        duplicate = (
+            (existing["year"] == int(year))
+            & (existing["round"] == int(round_number))
+            & (existing["stage"] == manifest.stage)
+        )
+        if duplicate.any():
+            log.info(
+                "replacing %d existing prediction row(s) for %s R%s [%s]",
+                int(duplicate.sum()), year, round_number, manifest.stage,
+            )
+            existing = existing.loc[~duplicate]
+        frame = pd.concat([existing, frame], ignore_index=True)
+    frame = frame.sort_values(["year", "round", "stage", "predicted"],
+                              ascending=[True, True, True, False])
+    frame.to_csv(path, index=False)
+    return path
+
+
+def record_outcomes(
+    outcomes: pd.DataFrame,
+    *,
+    year: int,
+    round_number: int,
+    path: Path = PREDICTIONS_PATH,
+) -> int:
+    """Fill in what actually happened, for every stage predicted at that race.
+
+    Args:
+        outcomes: Must carry ``DriverId`` and ``dnf`` for the completed race.
+
+    Returns:
+        How many prediction rows were matched and filled.
+    """
+    if not path.exists():
+        return 0
+    frame = pd.read_csv(path)
+    target = (frame["year"] == int(year)) & (frame["round"] == int(round_number))
+    if not target.any():
+        return 0
+    truth = dict(zip(outcomes["DriverId"], outcomes["dnf"]))
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    filled = frame.loc[target, "driver_id"].map(truth)
+
+    # An all-blank column is read back as float64, so writing a timestamp into
+    # it warns and will eventually raise.  Both columns are widened once, here,
+    # rather than depending on what the last read happened to infer.
+    frame["dnf"] = pd.to_numeric(frame["dnf"], errors="coerce")
+    frame["scored_at"] = frame["scored_at"].astype("object")
+
+    frame.loc[target, "dnf"] = filled
+    matched = target & filled.notna().reindex(frame.index, fill_value=False)
+    frame.loc[matched, "scored_at"] = now
+    frame.to_csv(path, index=False)
+    return int(filled.notna().sum())
+
+
+def read_predictions(path: Path = PREDICTIONS_PATH) -> pd.DataFrame:
+    """Every prediction made, scored and unscored."""
+    if not path.exists():
+        return pd.DataFrame(columns=list(PREDICTION_COLUMNS))
+    return pd.read_csv(path)

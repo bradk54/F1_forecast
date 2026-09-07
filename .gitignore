@@ -40,6 +40,7 @@ Data/raw/fastf1_cache/
 # Keep the model performance log.  It is a few kilobytes and the entire point
 # is to be able to read drift out of the diff, one race at a time.
 !Reports/model_log.csv
+!Reports/predictions.csv
 
 # The fitted model and its manifest are rebuilt in a quarter of a second from
 # the dataset, so they are artefacts rather than source.  Only the current pair

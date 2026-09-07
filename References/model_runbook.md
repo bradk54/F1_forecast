@@ -154,7 +154,13 @@ Models/dnf_model.joblib          the fitted pipeline, ~2 MB          (gitignored
 Models/dnf_model.json            the manifest                        (gitignored)
 Models/pending_prediction.json   last prediction, awaiting its race  (gitignored)
 Reports/model_log.csv            one row per scored race             (COMMITTED)
+Reports/predictions.csv          one row per driver per prediction   (COMMITTED)
 ```
+
+**Nothing in `Models/` arrives with a clone.** It is gitignored and rebuilt in a
+quarter of a second, so on a fresh checkout run `refresh --no-download` before
+anything expects a model to exist. The two files in `Reports/` are the durable
+record and do travel with the repository.
 
 Only the **current** model is kept. Two megabytes per race across a season is
 forty-odd files nobody opens, and the log already records what each one scored.
@@ -183,7 +189,31 @@ and **environment drift** (a different scikit-learn pickled it).
 
 ---
 
-## Reading the log
+## The two logs
+
+`Reports/model_log.csv` says **how a weekend went** — one row per race, the
+aggregate scores. `Reports/predictions.csv` says **what was claimed about each
+car** — one row per driver per prediction, written before the race with `dnf`
+and `scored_at` left blank, and filled in by the next `refresh`.
+
+The second exists because the first cannot answer "what did we say about this
+driver before Barcelona". It is also the honest record: a row is written at a
+point where the answer does not exist yet, so it cannot be quietly revised once
+the result is known.
+
+Predicting the same race twice at the same stage **replaces** the earlier rows.
+The two stages are kept separately, because a Thursday call and a Saturday call
+are different claims, and `refresh` fills in the outcome for both.
+
+```python
+import pandas as pd
+p = pd.read_csv("Reports/predictions.csv")
+scored = p[p.dnf.notna()]
+scored.groupby("driver_id").agg(n=("dnf", "size"), mean_pred=("predicted", "mean"),
+                                actual=("dnf", "mean"))
+```
+
+### Reading the race log
 
 One row per race. Two things will look wrong and are not:
 

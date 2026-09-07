@@ -121,10 +121,12 @@ Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Interme
 - **Serving artefacts are rebuilt, not stored.** A fit on the default window is
   815 rows and about a quarter of a second, so `Models/dnf_model.joblib` and its
   manifest are gitignored and only the current pair is kept. What *is* committed
-  is `Reports/model_log.csv`, one row per scored race — the point of it is being
-  able to read drift out of the diff. `refresh` scores the outstanding
-  prediction **before** refitting; reversing that makes the log in-sample and
-  worthless.
+  are the two logs in `Reports/`: `model_log.csv`, one row per scored race, and
+  `predictions.csv`, one row per driver per prediction. The second is written
+  before the race with its outcome blank and filled in afterwards, so it records
+  a claim made when the answer did not exist and cannot be revised once it does.
+  `refresh` scores the outstanding prediction **before** refitting; reversing
+  that makes both logs in-sample and worthless.
 - **Stage is not a confidence dial.** `grid_position` is the strongest feature
   in the model, so `pre_weekend` (95 features) and `post_quali` (101) are
   different models. A missing grid is imputed to the back of the field by

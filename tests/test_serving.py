@@ -378,3 +378,165 @@ def test_circuit_is_carried_over_from_the_last_running(raw_for_inference) -> Non
     name = raw_for_inference["EventName"].iloc[0]
     assert circuit_for_event(raw_for_inference, name) is not None
     assert circuit_for_event(raw_for_inference, "Never Held Grand Prix") is None
+
+
+# --------------------------------------------------------------------------- #
+# Per-driver prediction log
+# --------------------------------------------------------------------------- #
+#
+# The race-level log says how a weekend went. This says what was claimed about
+# each car, which is the only thing that answers "what did we say about this
+# driver before that race" once the weekend is over.
+
+
+@pytest.fixture
+def prediction_rows() -> pd.DataFrame:
+    return pd.DataFrame({
+        "DriverId": ["a", "b", "c"],
+        "TeamId": ["t1", "t1", "t2"],
+        "grid_position": [1.0, 5.0, 20.0],
+        "predicted": [0.05, 0.20, 0.40],
+    })
+
+
+def write_predictions(path, rows, manifest, rnd=14, stage=None):
+    if stage is not None:
+        manifest.stage = stage
+    return monitor.append_predictions(
+        rows, manifest, year=2026, round_number=rnd,
+        event="Test Grand Prix", race_date="2026-09-13", path=path,
+    )
+
+
+def test_predictions_are_written_one_row_per_driver(
+    tmp_path, prediction_rows, modelling_dataset
+) -> None:
+    _, manifest, _ = fit_current(modelling_dataset, model="logistic")
+    path = tmp_path / "predictions.csv"
+    write_predictions(path, prediction_rows, manifest)
+
+    frame = monitor.read_predictions(path)
+    assert len(frame) == 3
+    assert list(frame.columns) == list(monitor.PREDICTION_COLUMNS)
+    assert set(frame["driver_id"]) == {"a", "b", "c"}
+
+
+def test_the_outcome_is_blank_until_the_race_runs(
+    tmp_path, prediction_rows, modelling_dataset
+) -> None:
+    """A row is written where the answer does not yet exist. That is the point."""
+    _, manifest, _ = fit_current(modelling_dataset, model="logistic")
+    path = tmp_path / "predictions.csv"
+    write_predictions(path, prediction_rows, manifest)
+
+    frame = monitor.read_predictions(path)
+    assert frame["dnf"].isna().all()
+    assert frame["scored_at"].isna().all()
+
+
+def test_outcomes_are_filled_in_after_the_race(
+    tmp_path, prediction_rows, modelling_dataset
+) -> None:
+    _, manifest, _ = fit_current(modelling_dataset, model="logistic")
+    path = tmp_path / "predictions.csv"
+    write_predictions(path, prediction_rows, manifest)
+
+    outcomes = pd.DataFrame({"DriverId": ["a", "b", "c"], "dnf": [0, 1, 1]})
+    filled = monitor.record_outcomes(outcomes, year=2026, round_number=14, path=path)
+    assert filled == 3
+
+    frame = monitor.read_predictions(path).set_index("driver_id")
+    assert frame.loc["a", "dnf"] == 0
+    assert frame.loc["b", "dnf"] == 1
+    assert frame.loc["c", "dnf"] == 1
+    assert frame["scored_at"].notna().all()
+    # The prediction itself must survive scoring unchanged.
+    assert frame.loc["c", "predicted"] == pytest.approx(0.40)
+
+
+def test_scoring_leaves_other_races_alone(
+    tmp_path, prediction_rows, modelling_dataset
+) -> None:
+    _, manifest, _ = fit_current(modelling_dataset, model="logistic")
+    path = tmp_path / "predictions.csv"
+    write_predictions(path, prediction_rows, manifest, rnd=14)
+    write_predictions(path, prediction_rows, manifest, rnd=15)
+
+    outcomes = pd.DataFrame({"DriverId": ["a", "b", "c"], "dnf": [0, 1, 1]})
+    monitor.record_outcomes(outcomes, year=2026, round_number=14, path=path)
+
+    frame = monitor.read_predictions(path)
+    assert frame.loc[frame["round"] == 14, "dnf"].notna().all()
+    assert frame.loc[frame["round"] == 15, "dnf"].isna().all()
+
+
+def test_repredicting_replaces_rather_than_duplicates(
+    tmp_path, prediction_rows, modelling_dataset
+) -> None:
+    """Running the command twice on a Saturday must not leave two records."""
+    _, manifest, _ = fit_current(modelling_dataset, model="logistic")
+    path = tmp_path / "predictions.csv"
+    write_predictions(path, prediction_rows, manifest)
+    write_predictions(path, prediction_rows.assign(predicted=[0.9, 0.9, 0.9]), manifest)
+
+    frame = monitor.read_predictions(path)
+    assert len(frame) == 3
+    assert (frame["predicted"] == 0.9).all()
+
+
+def test_the_two_stages_are_kept_separately(
+    tmp_path, prediction_rows, modelling_dataset
+) -> None:
+    """A pre-weekend call and a post-quali call are different claims."""
+    _, manifest, _ = fit_current(modelling_dataset, model="logistic")
+    path = tmp_path / "predictions.csv"
+    write_predictions(path, prediction_rows, manifest, stage="pre_weekend")
+    write_predictions(path, prediction_rows, manifest, stage="post_quali")
+
+    frame = monitor.read_predictions(path)
+    assert len(frame) == 6
+    assert set(frame["stage"]) == {"pre_weekend", "post_quali"}
+
+
+def test_scoring_fills_every_stage_of_that_race(
+    tmp_path, prediction_rows, modelling_dataset
+) -> None:
+    _, manifest, _ = fit_current(modelling_dataset, model="logistic")
+    path = tmp_path / "predictions.csv"
+    write_predictions(path, prediction_rows, manifest, stage="pre_weekend")
+    write_predictions(path, prediction_rows, manifest, stage="post_quali")
+
+    outcomes = pd.DataFrame({"DriverId": ["a", "b", "c"], "dnf": [0, 1, 1]})
+    assert monitor.record_outcomes(
+        outcomes, year=2026, round_number=14, path=path
+    ) == 6
+
+
+def test_a_driver_who_did_not_start_stays_unscored(
+    tmp_path, prediction_rows, modelling_dataset
+) -> None:
+    """Predicted, then withdrew: no outcome to record, and none invented."""
+    _, manifest, _ = fit_current(modelling_dataset, model="logistic")
+    path = tmp_path / "predictions.csv"
+    write_predictions(path, prediction_rows, manifest)
+
+    partial = pd.DataFrame({"DriverId": ["a", "b"], "dnf": [0, 1]})
+    assert monitor.record_outcomes(
+        partial, year=2026, round_number=14, path=path
+    ) == 2
+
+    frame = monitor.read_predictions(path).set_index("driver_id")
+    assert pd.isna(frame.loc["c", "dnf"])
+    assert pd.isna(frame.loc["c", "scored_at"])
+
+
+def test_scoring_an_unpredicted_race_is_a_no_op(tmp_path) -> None:
+    outcomes = pd.DataFrame({"DriverId": ["a"], "dnf": [1]})
+    path = tmp_path / "nothing.csv"
+    assert monitor.record_outcomes(outcomes, year=2026, round_number=14, path=path) == 0
+
+
+def test_reading_an_absent_prediction_log(tmp_path) -> None:
+    frame = monitor.read_predictions(tmp_path / "nothing.csv")
+    assert frame.empty
+    assert list(frame.columns) == list(monitor.PREDICTION_COLUMNS)
