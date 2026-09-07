@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from src.models.train import (
+    MODEL_FACTORIES,
     calibration_slope,
     race_bootstrap,
     score_predictions,
@@ -100,11 +101,37 @@ def test_post_quali_stage_includes_grid_position(modelling_dataset) -> None:
     assert "grid_position" in result.features
 
 
-def test_both_model_families_run(modelling_dataset) -> None:
-    for model in ("logistic", "gradient_boosting"):
-        result = walk_forward_evaluate(modelling_dataset, model=model)
-        assert not result.scores.empty, model
-        assert result.predictions["predicted"].between(0, 1).all(), model
+@pytest.mark.parametrize("model", sorted(MODEL_FACTORIES))
+def test_every_model_family_runs(modelling_dataset, model: str) -> None:
+    result = walk_forward_evaluate(modelling_dataset, model=model)
+    assert not result.scores.empty, model
+    assert result.predictions["predicted"].between(0, 1).all(), model
+
+
+def test_baseline_predicts_one_constant_per_fold(modelling_dataset) -> None:
+    """The reference model must be exactly that: the training base rate.
+
+    If this ever varies within a season, the comparison every other model is
+    judged against has stopped being a base rate.
+    """
+    result = walk_forward_evaluate(modelling_dataset, model="baseline")
+    per_season = result.predictions.groupby("Year", observed=True)["predicted"].nunique()
+    assert (per_season == 1).all()
+
+
+def test_baseline_scores_no_skill(modelling_dataset) -> None:
+    """Zero Brier skill by construction, and no ranking information at all."""
+    summary = walk_forward_evaluate(modelling_dataset, model="baseline").summary()
+    assert abs(summary["brier_skill"]) < 1e-6
+    assert summary["roc_auc"] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_random_forest_handles_cold_start_nans(modelling_dataset) -> None:
+    """RandomForest cannot take NaN natively; the imputer must cover every row."""
+    frame = modelling_dataset.copy()
+    frame.loc[frame.index[:50], "driver_dnf_rate_10"] = np.nan
+    result = walk_forward_evaluate(frame, model="random_forest")
+    assert result.predictions["predicted"].notna().all()
 
 
 def test_drop_features_removes_them(modelling_dataset) -> None:

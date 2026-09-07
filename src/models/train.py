@@ -47,7 +47,8 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -149,9 +150,103 @@ def make_gradient_boosting(
     )
 
 
+def make_baseline(numeric: Sequence[str], categorical: Sequence[str]) -> Pipeline:
+    """Predict the training set's base rate for every row.
+
+    The reference every other model has to beat.  It is the honest form of
+    "just guess the average": it gets 86% of rows right on a 14% target while
+    being completely useless, which is exactly why accuracy is not reported
+    anywhere in this module.
+    """
+    return Pipeline(
+        [
+            ("prep", ColumnTransformer(
+                [("num", "passthrough", list(numeric))], remainder="drop")),
+            ("clf", DummyClassifier(strategy="prior")),
+        ]
+    )
+
+
+def make_random_forest(
+    numeric: Sequence[str], categorical: Sequence[str]
+) -> Pipeline:
+    """Bagged trees, as a variance-reduction counterpoint to boosting.
+
+    Unlike ``HistGradientBoosting`` this cannot take NaN, so cold-start rows
+    are median-imputed and flagged.  The indicator columns matter more than the
+    imputed values: "this is a rookie" is the signal, and without the flag the
+    model would read a rookie as an average-risk driver.
+    """
+    steps: list[tuple[str, Any, list[str]]] = [
+        ("num",
+         SimpleImputer(strategy="median", add_indicator=True),
+         list(numeric)),
+    ]
+    if categorical:
+        steps.append(
+            ("cat", OneHotEncoder(handle_unknown="ignore", drop="first"),
+             list(categorical))
+        )
+    return Pipeline(
+        [
+            ("prep", ColumnTransformer(steps, remainder="drop")),
+            (
+                "clf",
+                RandomForestClassifier(
+                    n_estimators=500,
+                    min_samples_leaf=15,
+                    max_features="sqrt",
+                    n_jobs=-1,
+                    random_state=config.RANDOM_SEED,
+                ),
+            ),
+        ]
+    )
+
+
+def make_xgboost(numeric: Sequence[str], categorical: Sequence[str]) -> Pipeline:
+    """Gradient boosting via XGBoost, which also routes NaN natively.
+
+    Kept deliberately close to :func:`make_gradient_boosting` in depth and
+    learning rate: the point of running both is to see whether the result is
+    an artefact of one implementation's defaults, not to hyper-tune either.
+    """
+    from xgboost import XGBClassifier
+
+    steps: list[tuple[str, Any, list[str]]] = [("num", "passthrough", list(numeric))]
+    if categorical:
+        steps.append(
+            ("cat", OneHotEncoder(handle_unknown="ignore", drop="first"),
+             list(categorical))
+        )
+    return Pipeline(
+        [
+            ("prep", ColumnTransformer(steps, remainder="drop")),
+            (
+                "clf",
+                XGBClassifier(
+                    n_estimators=400,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    min_child_weight=10,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    reg_lambda=1.0,
+                    eval_metric="logloss",
+                    tree_method="hist",
+                    random_state=config.RANDOM_SEED,
+                ),
+            ),
+        ]
+    )
+
+
 MODEL_FACTORIES = {
+    "baseline": make_baseline,
     "logistic": make_logistic,
+    "random_forest": make_random_forest,
     "gradient_boosting": make_gradient_boosting,
+    "xgboost": make_xgboost,
 }
 
 
