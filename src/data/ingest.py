@@ -419,7 +419,17 @@ def collect_season_results(
     import fastf1
 
     report = report if report is not None else IngestReport()
-    schedule = fastf1.get_event_schedule(year, include_testing=False)
+    try:
+        schedule = fastf1.get_event_schedule(year, include_testing=False)
+    except Exception as exc:  # noqa: BLE001 - surfaced through the report
+        # FastF1 tries three backends for a calendar and raises only when all
+        # three fail, which means the network is down or the Ergast backend is
+        # rate-limiting.  Neither is this season's fault, and neither should
+        # take down the seasons after it, so it is reported like any other
+        # failure -- the same way collect_circuit_profiles has always handled it.
+        log.warning("could not load the %s schedule: %s", year, exc)
+        report.add_failure(f"{year} schedule", exc)
+        return pd.DataFrame()
     frames: list[pd.DataFrame] = []
 
     for _, event in schedule.iterrows():

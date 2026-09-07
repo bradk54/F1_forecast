@@ -381,6 +381,25 @@ operational one — do not work around it. The failing feature is named in the
 output; fix it in `src/features/build_features.py` and add a case to
 `tests/test_leakage.py`.
 
+### `ValueError: Failed to load any schedule data.` / `any API: 500 calls/h`
+
+Ergast allows 500 calls an hour and you have spent them, or the network is
+down. FastF1 tries three backends for a calendar and raises only when all three
+fail. The season is reported as a failure and the run continues; if *every*
+season fails the build stops with instructions rather than a traceback.
+
+The fix is not to wait — it is to stop going to the network at all:
+
+```bash
+F1_FASTF1_CACHE="$PWD/Data/raw" \
+  ./.venv/bin/python -m src.models.predict refresh --offline
+```
+
+**Check `F1_FASTF1_CACHE` first.** The default is `Data/raw/fastf1_cache`, and
+if your cache actually lives at `Data/raw` then every session is a cache miss
+and a full rebuild will exhaust the hourly limit on its own. `find Data/raw
+-name '*.ff1pkl' | wc -l` tells you where the cache really is.
+
 ### The pull is slow, or hits HTTP 429
 
 `api.jolpi.ca` rate-limits. A warm cache avoids it entirely:
