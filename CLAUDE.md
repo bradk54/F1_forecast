@@ -65,7 +65,22 @@ src/features/build_features.py  leakage-safe rolling history (driver/team/pairin
 src/features/track_profile.py   circuit geometry from a reference lap's telemetry
 src/features/registry.py      single source of truth for every feature and when it is knowable
 src/models/train.py           walk-forward evaluation, ablation, permutation importance
+src/models/store.py           saves the fitted model + a manifest that refuses stale/drifted loads
+src/models/monitor.py         the per-race performance log and the drift check
+src/models/predict.py         the CLI: refresh, next, race, status
 ```
+
+### Running the model week to week
+
+```bash
+./.venv/bin/python -m src.models.predict refresh   # Tuesday: score, refit, save
+./.venv/bin/python -m src.models.predict next      # Saturday, after qualifying
+./.venv/bin/python -m src.models.predict status    # how it has been doing
+```
+
+**`References/model_runbook.md` is the operational guide** — assumptions,
+failure modes, and why running before qualifying is a different model rather
+than a less confident one. Read it before changing anything in `src/models/`.
 
 Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Intermediates cache to `Data/processed/{race_results,circuit_profiles}.parquet`; the modelling table lands at `Data/processed/dnf_dataset.parquet`. `--skip-download` reuses those parquets; `--offline` rebuilds from the fastf1 cache without network.
 
@@ -103,6 +118,18 @@ Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Interme
   season; in a settled formula the best window is probably longer.
   The short-window and EWMA *features* are, by contrast, close to neutral —
   keep them, but do not credit them for this.
+- **Serving artefacts are rebuilt, not stored.** A fit on the default window is
+  815 rows and about a quarter of a second, so `Models/dnf_model.joblib` and its
+  manifest are gitignored and only the current pair is kept. What *is* committed
+  is `Reports/model_log.csv`, one row per scored race — the point of it is being
+  able to read drift out of the diff. `refresh` scores the outstanding
+  prediction **before** refitting; reversing that makes the log in-sample and
+  worthless.
+- **Stage is not a confidence dial.** `grid_position` is the strongest feature
+  in the model, so `pre_weekend` (95 features) and `post_quali` (101) are
+  different models. A missing grid is imputed to the back of the field by
+  `add_race_context`, which inflates every prediction, so `predict` refuses
+  `post_quali` without a grid rather than quietly producing those numbers.
 - **Sprints inform history but are not modelling rows.** A 100 km sprint and a 305 km grand prix do not share an attrition process.
 - **Exit codes:** 1 no data / unreachable, 2 missing cached intermediates, 3 leakage, 4 a race with no finishing status.
 
