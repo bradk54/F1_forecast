@@ -133,7 +133,14 @@ Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Interme
   `add_race_context`, which inflates every prediction, so `predict` refuses
   `post_quali` without a grid rather than quietly producing those numbers.
 - **Sprints inform history but are not modelling rows.** A 100 km sprint and a 305 km grand prix do not share an attrition process.
-- **Exit codes:** 1 no data / unreachable, 2 missing cached intermediates, 3 leakage, 4 a race with no finishing status.
+- **A rebuild may not lose races.** Every other guard protects against bad rows;
+  none notices missing ones. A rate-limited pull drops the rounds it cannot
+  confirm, the survivors are all valid, and the status check passes on a dataset
+  that lost a third of its calendar — observed taking 2025 from 24 races to 10.
+  `lost_races` compares against the results on disk *before* overwriting them
+  and returns exit 5 rather than writing.
+- **Exit codes:** 1 no data / unreachable, 2 missing cached intermediates,
+  3 leakage, 4 a race with no finishing status, 5 a rebuild that lost races.
 
 ## Conventions
 

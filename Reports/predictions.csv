@@ -1,0 +1,23 @@
+predicted_at,year,round,event,race_date,stage,model,git_sha,trained_through_round,train_base_rate,driver_id,team_id,grid_position,predicted,dnf,scored_at
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,stroll,aston_martin,22.0,0.35559,1.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,alonso,aston_martin,22.0,0.33579,1.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,bottas,cadillac,22.0,0.32578,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,perez,cadillac,22.0,0.31698,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,albon,williams,22.0,0.19416,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,sainz,williams,22.0,0.18841,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,leclerc,ferrari,22.0,0.15916,1.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,ocon,haas,22.0,0.13049,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,bearman,haas,22.0,0.12991,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,max_verstappen,red_bull,22.0,0.12788,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,hamilton,ferrari,22.0,0.10899,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,norris,mclaren,22.0,0.10734,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,russell,mercedes,22.0,0.10329,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,gasly,alpine,22.0,0.09788,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,hulkenberg,audi,22.0,0.08903,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,arvid_lindblad,rb,22.0,0.07763,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,piastri,mclaren,22.0,0.07402,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,tsunoda,rb,22.0,0.07039,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,antonelli,mercedes,22.0,0.07013,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,colapinto,alpine,22.0,0.06383,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,lawson,red_bull,22.0,0.06314,0.0,2026-09-07T20:29:50+00:00
+2026-09-07T20:29:49+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,13,0.14356,bortoleto,audi,22.0,0.06142,0.0,2026-09-07T20:29:50+00:00

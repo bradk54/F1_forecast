@@ -12,9 +12,11 @@ from src import config
 from src.data.generate_dataset import (
     build_dataset,
     join_circuit_profiles,
+    lost_races,
     main,
     parse_seasons,
     prepare_circuit_profiles,
+    race_calendar,
     status_coverage,
 )
 from src.features import registry
@@ -351,3 +353,111 @@ def test_main_counts_the_rows_that_carry_a_status(cli, raw_results, capsys) -> N
     _, out, _ = cli(raw_results, capsys)
     (line,) = [ln for ln in out.splitlines() if "status check" in ln]
     assert re.search(r"\((\d+)/\1 rows carry a finishing status\)", line), line
+
+
+# --------------------------------------------------------------------------- #
+# Coverage: races that vanish from a rebuild
+# --------------------------------------------------------------------------- #
+#
+# Every other guard protects against bad rows. None notices missing ones, and a
+# rate-limited pull produces exactly that: the degraded-results guard correctly
+# drops rounds the backend could not confirm, the survivors are all valid, and
+# the status check passes on a dataset that lost a third of its calendar.
+
+
+def drop_races(results: pd.DataFrame, pairs) -> pd.DataFrame:
+    keep = ~results.set_index(["Year", "RoundNumber"]).index.isin(list(pairs))
+    return results.loc[keep].reset_index(drop=True)
+
+
+def test_calendar_is_one_row_per_grand_prix(raw_results) -> None:
+    calendar = race_calendar(raw_results)
+    assert not calendar.duplicated(["Year", "RoundNumber"]).any()
+    assert len(calendar) == raw_results.groupby(
+        ["Year", "RoundNumber"], observed=True
+    ).ngroups
+
+
+def test_nothing_lost_is_a_pass(raw_results) -> None:
+    assert lost_races(raw_results, raw_results).empty
+
+
+def test_a_rate_limited_rebuild_is_caught(raw_results) -> None:
+    """The observed failure: races silently absent from the new pull."""
+    degraded = drop_races(raw_results, [(2022, 5), (2023, 2), (2023, 3)])
+    lost = lost_races(degraded, raw_results)
+
+    assert len(lost) == 3
+    assert set(map(tuple, lost[["Year", "RoundNumber"]].to_numpy())) == {
+        (2022, 5), (2023, 2), (2023, 3)
+    }
+
+
+def test_gaining_races_is_not_a_loss(raw_results) -> None:
+    """The normal case: a new round appears. That must not trip the check."""
+    extra = raw_results.loc[raw_results["RoundNumber"] == 1].copy()
+    extra["RoundNumber"] = 99
+    grown = pd.concat([raw_results, extra], ignore_index=True)
+    assert lost_races(grown, raw_results).empty
+
+
+def test_narrowing_the_season_range_is_not_a_loss(raw_results) -> None:
+    """Building 2023 only must not read as losing every 2021 and 2022 race."""
+    narrow = raw_results.loc[raw_results["Year"] == 2023]
+    assert lost_races(narrow, raw_results, seasons=[2023]).empty
+    # Without the scope, the same comparison is alarming and correctly so.
+    assert not lost_races(narrow, raw_results).empty
+
+
+def test_a_first_build_has_nothing_to_compare(raw_results) -> None:
+    assert lost_races(raw_results, pd.DataFrame()).empty
+
+
+def test_sprints_do_not_count_as_races(raw_results) -> None:
+    """Losing a sprint is routine; losing a grand prix is not."""
+    with_sprint = raw_results.copy()
+    sprint = with_sprint.loc[with_sprint["RoundNumber"] == 1].copy()
+    sprint["session_type"] = "S"
+    both = pd.concat([with_sprint, sprint], ignore_index=True)
+
+    assert lost_races(with_sprint, both).empty, "a missing sprint is not a lost race"
+
+
+def test_main_refuses_to_overwrite_with_a_shrunken_pull(
+    cli, raw_results, capsys, monkeypatch
+) -> None:
+    """The whole point: the good results survive a bad rebuild."""
+    # Seed the on-disk results with the full calendar.
+    code, _, _ = cli(raw_results, capsys)
+    assert code == 0
+
+    degraded = drop_races(raw_results, [(2022, 5), (2023, 2)])
+    monkeypatch.setattr(
+        "src.data.generate_dataset.collect_raw",
+        lambda seasons, **kwargs: (degraded, pd.DataFrame()),
+    )
+    code = main(["--seasons", "2021-2023"])
+    out = capsys.readouterr().out
+
+    assert code == 5, out
+    assert "coverage check: FAILED" in out
+    assert "NOT overwritten" in out
+    # And the good results are still there.
+    on_disk = pd.read_parquet(config.RACE_RESULTS_PATH)
+    assert len(race_calendar(on_disk)) == len(race_calendar(raw_results))
+
+
+def test_allow_shrink_lets_it_through(
+    cli, raw_results, capsys, monkeypatch
+) -> None:
+    cli(raw_results, capsys)
+    degraded = drop_races(raw_results, [(2022, 5)])
+    monkeypatch.setattr(
+        "src.data.generate_dataset.collect_raw",
+        lambda seasons, **kwargs: (degraded, pd.DataFrame()),
+    )
+    code = main(["--seasons", "2021-2023", "--allow-shrink"])
+    assert code == 0, capsys.readouterr().out
+    assert len(race_calendar(pd.read_parquet(config.RACE_RESULTS_PATH))) == len(
+        race_calendar(degraded)
+    )
