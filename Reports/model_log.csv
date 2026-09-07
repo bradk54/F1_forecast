@@ -1,0 +1,2 @@
+scored_at,year,round,event,race_date,stage,model,git_sha,train_rows,train_base_rate,lookback_races,n,observed_rate,mean_predicted,brier,brier_base,brier_skill,log_loss,roc_auc,pr_auc,top2_hits,top2_lift
+2026-09-07T20:29:50+00:00,2026,13,Italian Grand Prix,2026-09-06,pre_weekend,random_forest,d487694,815,0.14356,40,22,0.13636,0.14778,0.089923,0.11782,0.23678,0.30051,0.92982,0.80952,2,7.333

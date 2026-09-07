@@ -374,6 +374,17 @@ the guard working. Either retry later, or rebuild from the warm cache:
 ./.venv/bin/python -m src.models.predict refresh --offline
 ```
 
+### `coverage check: FAILED (N race(s) present before and missing now)`
+
+The rebuild covers fewer races than the results it was about to replace, so
+**nothing was overwritten**. Races vanish from a pull when the backend cannot
+confirm them -- almost always an Ergast rate limit. The rows that survive are
+perfectly valid, which is why no other check fires; only this one notices that
+a third of the calendar went missing.
+
+Retry once the limit clears, rebuild from the cache with `--offline`, or pass
+`--allow-shrink` if you meant to narrow the data.
+
 ### `leakage check: FAILED` during a refresh
 
 A feature is reading the current race's outcome. This is a code bug, not an

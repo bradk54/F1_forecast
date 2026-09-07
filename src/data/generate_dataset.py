@@ -13,7 +13,9 @@ The pipeline runs in four stages, each of which can be re-run on its own:
 
 The CLI reports a failed check rather than writing a dataset that would fail
 it: exit 3 for detected leakage, exit 4 for a race that reached the modelling
-table with no finishing status on any row (see :func:`status_coverage`).
+table with no finishing status on any row (see :func:`status_coverage`), and
+exit 5 for a rebuild that covers fewer races than the results it would replace
+(see :func:`lost_races`).
 
 The expensive stage is the second: it downloads telemetry for one session per
 event.  Its output is cached to parquet, so a rebuild that only changes feature
@@ -232,6 +234,66 @@ def join_circuit_profiles(
     return out
 
 
+def race_calendar(frame: pd.DataFrame) -> pd.DataFrame:
+    """The grands prix a results frame covers, one row each."""
+    if frame.empty or not {"Year", "RoundNumber"}.issubset(frame.columns):
+        return pd.DataFrame(columns=["Year", "RoundNumber", "EventName"])
+    races = frame
+    if "session_type" in races.columns:
+        races = races.loc[races["session_type"] == "R"]
+    columns = [c for c in ("Year", "RoundNumber", "EventName") if c in races.columns]
+    return (
+        races[columns]
+        .drop_duplicates(subset=["Year", "RoundNumber"])
+        .sort_values(["Year", "RoundNumber"])
+        .reset_index(drop=True)
+    )
+
+
+def lost_races(
+    new: pd.DataFrame,
+    previous: pd.DataFrame,
+    *,
+    seasons: Sequence[int] | None = None,
+) -> pd.DataFrame:
+    """Races the previous results had and the new ones do not.
+
+    The guards elsewhere in this pipeline protect against *bad* rows -- a race
+    labelled as an all-retirement event, a feature that reads the current race.
+    None of them notice *missing* rows, and a rate-limited pull produces exactly
+    that: :class:`~src.data.ingest.DegradedResultsError` correctly drops every
+    round Ergast could not confirm, the remaining rows are all perfectly valid,
+    and the status check passes on a dataset that quietly lost a third of its
+    calendar.
+
+    Observed: a rate-limited rebuild took 2025 from 24 races to 10 and 2026 from
+    13 to 1, wrote the result, and reported PASS.
+
+    Args:
+        seasons: Restrict the comparison to these years.  Without it, building a
+            deliberately narrower range reads as catastrophic loss.
+
+    Returns:
+        One row per missing race, empty when nothing was lost -- the same
+        "empty is a pass" convention the leakage and status reports use.
+    """
+    before = race_calendar(previous)
+    after = race_calendar(new)
+    if before.empty:
+        return before
+    if seasons is not None:
+        before = before.loc[before["Year"].isin(list(seasons))]
+    if before.empty:
+        return before
+
+    have = set(map(tuple, after[["Year", "RoundNumber"]].to_numpy()))
+    missing = [
+        tuple(row) not in have
+        for row in before[["Year", "RoundNumber"]].to_numpy()
+    ]
+    return before.loc[missing].reset_index(drop=True)
+
+
 def status_coverage(frame: pd.DataFrame) -> pd.DataFrame:
     """Per-race count of rows carrying a usable ``Status``.
 
@@ -396,6 +458,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--out", type=Path, default=config.DNF_DATASET_PATH, help="Output parquet path."
     )
+    parser.add_argument(
+        "--allow-shrink",
+        action="store_true",
+        help="Write the results even if the rebuild covers fewer races than "
+             "the existing ones.  Use when the loss is intended.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
 
@@ -442,6 +510,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "  Check F1_FASTF1_CACHE points at the cache you actually have."
             )
             return 1
+        # Compare against what is on disk *before* overwriting it: once the
+        # parquet is replaced there is nothing left to compare against, and a
+        # pull that quietly lost half the calendar looks identical to a good one.
+        if config.RACE_RESULTS_PATH.exists() and not args.allow_shrink:
+            previous = pd.read_parquet(config.RACE_RESULTS_PATH)
+            lost = lost_races(results, previous, seasons=seasons)
+            if not lost.empty:
+                print(f"\n=== coverage check: FAILED "
+                      f"({len(lost)} race(s) present before and missing now) ===")
+                print(lost.to_string(index=False))
+                print(
+                    "\nThe existing results were NOT overwritten. Races vanish "
+                    "from a rebuild when the backend cannot confirm them -- "
+                    "usually an\nErgast rate limit -- and the rows that remain "
+                    "are valid, so no other check fires. Retry when the limit "
+                    "clears, rebuild from\nthe cache with --offline, or pass "
+                    "--allow-shrink if the loss is intended."
+                )
+                return 5
+
         _write(results, config.RACE_RESULTS_PATH, "results")
         if not profiles.empty:
             _write(profiles, config.CIRCUIT_PROFILE_PATH, "circuit profiles")
