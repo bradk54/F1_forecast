@@ -279,6 +279,289 @@ def add_team_history(
     return out
 
 
+def add_team_performance(
+    frame: pd.DataFrame,
+    *,
+    team_col: str = "TeamId",
+    driver_col: str = "DriverId",
+) -> pd.DataFrame:
+    """How well the team is *performing*, as distinct from how often it breaks.
+
+    :func:`add_team_history` measures a team's reliability.  This measures its
+    competitiveness, which is a different axis and moves retirement risk in its
+    own right: a slow car spends the race being lapped and passed, which is
+    where collisions happen, while a fast car runs in clean air.  Grid and
+    points also track development within a season -- an upgrade that works
+    shows up here weeks before it shows up in reliability.
+
+    Built at the team-race level and joined back, for the same reason as
+    :func:`add_team_history`: averaging driver rows directly would let a
+    driver's own result reach their team mate's feature through the shared mean.
+    """
+    out = frame.copy()
+    keys = race_keys(out)
+
+    agg: dict[str, tuple[str, str]] = {}
+    if "Points" in out.columns:
+        agg["team_points_race"] = ("Points", "sum")
+    if "Position" in out.columns:
+        # Mean over finishers only: ``Position`` is NaN for a retirement, so a
+        # team that lost both cars contributes NaN rather than a fabricated
+        # value.  Conditioning on finishing is deliberate -- the question is
+        # "when this car gets to the end, where does it end up".
+        agg["team_finish_race"] = ("Position", "mean")
+        agg["team_best_finish_race"] = ("Position", "min")
+    if "GridPosition" in out.columns:
+        agg["team_grid_race"] = ("GridPosition", "mean")
+    if not agg:
+        return out
+
+    team_race = (
+        _sorted(out)
+        .groupby([team_col, *keys, ORDER_COL], observed=True)
+        .agg(**agg)
+        .reset_index()
+    )
+
+    # Every column below is a rolling window over races strictly before the
+    # current one; the per-race aggregates above never travel back.
+    if "team_points_race" in team_race.columns:
+        for window in (5, 10):
+            team_race[f"team_points_rate_{window}"] = prior_rolling(
+                team_race, team_col, "team_points_race", window
+            )
+        team_race["team_points_rate_career"] = prior_expanding(
+            team_race, team_col, "team_points_race"
+        )
+        # Positive means the team is scoring above its own historical rate:
+        # a development curve, which a level rate cannot express.
+        team_race["team_form_delta"] = (
+            team_race["team_points_rate_5"] - team_race["team_points_rate_career"]
+        )
+    if "team_finish_race" in team_race.columns:
+        team_race["team_avg_finish_5"] = prior_rolling(
+            team_race, team_col, "team_finish_race", 5
+        )
+        team_race["team_best_finish_5"] = prior_rolling(
+            team_race, team_col, "team_best_finish_race", 5
+        )
+    if "team_grid_race" in team_race.columns:
+        for window in (5, 10):
+            team_race[f"team_avg_grid_{window}"] = prior_rolling(
+                team_race, team_col, "team_grid_race", window
+            )
+
+    current_race_intermediates = set(agg)
+    join_cols = [
+        c
+        for c in team_race.columns
+        if c.startswith("team_") and c not in current_race_intermediates
+    ]
+    return out.merge(
+        team_race[[team_col, *keys, *join_cols]],
+        on=[team_col, *keys],
+        how="left",
+        validate="many_to_one",
+    )
+
+
+def add_teammate_comparison(
+    frame: pd.DataFrame,
+    *,
+    team_col: str = "TeamId",
+    driver_col: str = "DriverId",
+) -> pd.DataFrame:
+    """Where this driver qualifies relative to the other car.
+
+    The team mate is the only genuine control for car quality in the sport: two
+    drivers, the same machinery, the same weekend.  A rolling qualifying delta
+    is therefore much closer to a measure of the driver than raw grid position,
+    which mostly measures the car.
+
+    Both columns are known once the grid is set, so they are ``post_quali``
+    features.  ``teammate_grid_delta`` describes the current race and is legal
+    precisely because grid position is settled before the race runs.
+    """
+    out = frame.copy()
+    keys = race_keys(out)
+    if "GridPosition" not in out.columns:
+        return out
+
+    grid = pd.to_numeric(out["GridPosition"], errors="coerce")
+    working = out[[*keys, team_col, driver_col]].assign(_grid=grid.to_numpy())
+
+    # The other car's grid slot, matched within team and race.
+    pairs = working.merge(
+        working.rename(columns={driver_col: "_mate", "_grid": "_mate_grid"}),
+        on=[*keys, team_col],
+        how="left",
+    )
+    pairs = pairs.loc[pairs[driver_col] != pairs["_mate"]]
+    mate_grid = (
+        pairs.groupby([*keys, team_col, driver_col], observed=True)["_mate_grid"]
+        .mean()
+        .reset_index()
+    )
+    out = out.merge(
+        mate_grid, on=[*keys, team_col, driver_col], how="left", validate="one_to_one"
+    )
+
+    # Negative is better: this driver started ahead of the other car.
+    out["teammate_grid_delta"] = grid - out["_mate_grid"]
+    out = out.drop(columns="_mate_grid")
+    out["driver_grid_vs_teammate_5"] = prior_rolling(
+        out, driver_col, "teammate_grid_delta", 5
+    )
+    return out
+
+
+def prior_ewma(
+    frame: pd.DataFrame,
+    group: str | Sequence[str],
+    value: str,
+    *,
+    halflife: float = 3.0,
+) -> pd.Series:
+    """Exponentially weighted mean over prior races, recent races weighted most.
+
+    A flat 5-race window says the race five weekends ago matters exactly as much
+    as last Sunday's and the one before that matters not at all.  Neither is
+    true: a car that broke last weekend is a different proposition from one that
+    broke in March.  The half-life is in races, so ``halflife=3`` gives the most
+    recent race roughly four times the weight of one six races back.
+
+    Like every builder here the ``shift(1)`` comes first, so the current race
+    never contributes to its own feature.
+    """
+    ordered = _sorted(frame)
+    grouped = ordered.groupby(list(np.atleast_1d(group)), observed=True)[value]
+    ewm = grouped.transform(
+        lambda s: s.shift(1).ewm(halflife=halflife, min_periods=1).mean()
+    )
+    return ewm.reindex(frame.index)
+
+
+def add_recency_features(
+    frame: pd.DataFrame,
+    *,
+    driver_col: str = "DriverId",
+    team_col: str = "TeamId",
+) -> pd.DataFrame:
+    """Short-window and recency-weighted views of retirement risk.
+
+    The rest of the history builders use 5-, 10- and career windows, which
+    describe a settled average.  Attrition is not settled: it moves with
+    regulation changes, with a development war that pushes cars past their
+    reliability margin, and with whatever the last few weekends happened to
+    throw up.  A model that reads the last three races differently from the last
+    thirty has a shot at tracking that; one built only on long windows cannot.
+
+    The field-level rate is the important one and the cheapest to overlook.  It
+    is the grid's own recent attrition -- one number per race, shared by every
+    driver in it -- and it carries the regime that no per-driver window can see.
+    """
+    out = frame.copy()
+    keys = race_keys(out)
+
+    # ---- field-level: the grid's recent attrition, one value per race -------
+    race_rate = (
+        _sorted(out)
+        .groupby([*keys, ORDER_COL], observed=True)
+        .agg(race_dnf_rate=("dnf", "mean"))
+        .reset_index()
+    )
+    # A constant group turns the per-entity helpers into a global rolling view.
+    race_rate["_all"] = 0
+    for window in (3, 5, 10):
+        race_rate[f"field_dnf_rate_last_{window}"] = prior_rolling(
+            race_rate, "_all", "race_dnf_rate", window
+        )
+    race_rate["field_dnf_rate_ewma"] = prior_ewma(
+        race_rate, "_all", "race_dnf_rate", halflife=3.0
+    )
+    join = [c for c in race_rate.columns if c.startswith("field_dnf_rate_")]
+    out = out.merge(
+        race_rate[[*keys, *join]], on=keys, how="left", validate="many_to_one"
+    )
+
+    # ---- entity-level: shorter windows than the builders above -------------
+    out["driver_dnf_rate_3"] = prior_rolling(out, driver_col, "dnf", 3)
+    out["driver_dnf_ewma"] = prior_ewma(out, driver_col, "dnf", halflife=3.0)
+
+    team_race = (
+        _sorted(out)
+        .groupby([team_col, *keys, ORDER_COL], observed=True)
+        .agg(team_dnf_share=("dnf", "mean"))
+        .reset_index()
+    )
+    team_race["team_dnf_rate_3"] = prior_rolling(
+        team_race, team_col, "team_dnf_share", 3
+    )
+    team_race["team_dnf_ewma"] = prior_ewma(
+        team_race, team_col, "team_dnf_share", halflife=3.0
+    )
+    # team_dnf_share describes the current race and stays behind.
+    out = out.merge(
+        team_race[[team_col, *keys, "team_dnf_rate_3", "team_dnf_ewma"]],
+        on=[team_col, *keys],
+        how="left",
+        validate="many_to_one",
+    )
+
+    # Season-to-date, which resets at the winter break.  A new car is a new
+    # reliability question, and carrying December's rate into March denies that.
+    if "Year" in out.columns:
+        out["driver_dnf_rate_season"] = prior_expanding(
+            out, [driver_col, "Year"], "dnf"
+        )
+    return out
+
+
+def add_field_context(frame: pd.DataFrame) -> pd.DataFrame:
+    """Properties of the whole grid, assembled from features already built.
+
+    Attrition is partly a property of the field rather than of any one car: a
+    grid of fragile cars retires more, and a grid where everyone is on similar
+    pace produces more close racing and so more contact.  Both are computable
+    before the race because every input is a prior-race rolling feature.
+
+    Depends on :func:`add_driver_history` and :func:`add_team_performance`
+    having run first.
+    """
+    out = frame.copy()
+    keys = race_keys(out)
+
+    if "driver_dnf_rate_10" in out.columns:
+        # How fragile this particular field is, on recent form.
+        out["field_dnf_rate_mean"] = out.groupby(keys, observed=True)[
+            "driver_dnf_rate_10"
+        ].transform("mean")
+        # Where this driver sits against the field they are actually racing:
+        # a 20% rate means something different on a fragile grid.
+        out["driver_dnf_rate_vs_field"] = (
+            out["driver_dnf_rate_10"] - out["field_dnf_rate_mean"]
+        )
+
+    if "team_points_rate_5" in out.columns:
+        # Spread of car quality across the grid.  A compressed field races
+        # closer together, which is where contact comes from.
+        out["field_pace_spread"] = out.groupby(keys, observed=True)[
+            "team_points_rate_5"
+        ].transform("std")
+        rank = out.groupby(keys, observed=True)["team_points_rate_5"].rank(
+            pct=True, ascending=False
+        )
+        out["team_rank_in_field"] = rank
+
+    if "RoundNumber" in out.columns and "Year" in out.columns:
+        rounds = out.groupby("Year", observed=True)["RoundNumber"].transform("max")
+        # Late-season cars are developed and well understood; early-season ones
+        # are neither.  Expressed as a fraction so seasons of different length
+        # are comparable.
+        out["season_progress"] = out["RoundNumber"] / rounds
+    return out
+
+
 def add_pairing_history(
     frame: pd.DataFrame,
     *,
@@ -403,6 +686,17 @@ def add_cause_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     out["dnf_incident"] = (
         cause.isin([COLLISION, DRIVER_ERROR]) & (out["dnf"] == 1)
     ).astype("int8")
+    # The remainder, and it is not small: roughly a third of retirements in a
+    # 2018-2025 pull carry the bare status ``Retired``, which states that the
+    # car stopped and nothing else.  Naming the bucket keeps it visible --
+    # mechanical and incident together do not add up to ``dnf``, and a
+    # cause-specific model that ignores this would be silently modelling two
+    # thirds of the target.
+    out["dnf_other"] = (
+        (out["dnf"] == 1)
+        & (out["dnf_mechanical"] == 0)
+        & (out["dnf_incident"] == 0)
+    ).astype("int8")
     return out
 
 
@@ -442,12 +736,17 @@ def build_history_features(
     frame = add_cause_indicators(frame)
     frame = add_driver_history(frame, driver_col=driver_col)
     frame = add_team_history(frame, team_col=team_col, driver_col=driver_col)
+    frame = add_team_performance(frame, team_col=team_col, driver_col=driver_col)
     frame = add_pairing_history(frame, driver_col=driver_col, team_col=team_col)
     if circuit_col in frame.columns:
         frame = add_circuit_history(
             frame, circuit_col=circuit_col, driver_col=driver_col
         )
     frame = add_race_context(frame)
+    frame = add_teammate_comparison(frame, team_col=team_col, driver_col=driver_col)
+    frame = add_recency_features(frame, driver_col=driver_col, team_col=team_col)
+    # Last: reads the rolling columns the builders above produced.
+    frame = add_field_context(frame)
     return frame
 
 
@@ -462,6 +761,7 @@ OUTCOME_COLUMNS = frozenset(
         "dnf", "dnf_cause", "dnf_strict", "dnf_classified", "finished_on_track",
         "classified", "classification_code", "started", "Status", "Position",
         "ClassifiedPosition", "Points", "Laps", "dnf_mechanical", "dnf_incident",
+        "dnf_other",
     }
 )
 

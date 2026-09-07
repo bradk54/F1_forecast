@@ -47,7 +47,8 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -61,6 +62,7 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from src import config
 from src.features import registry
+from src.features.build_features import ORDER_COL, RACE_KEYS
 
 log = logging.getLogger(__name__)
 
@@ -149,9 +151,103 @@ def make_gradient_boosting(
     )
 
 
+def make_baseline(numeric: Sequence[str], categorical: Sequence[str]) -> Pipeline:
+    """Predict the training set's base rate for every row.
+
+    The reference every other model has to beat.  It is the honest form of
+    "just guess the average": it gets 86% of rows right on a 14% target while
+    being completely useless, which is exactly why accuracy is not reported
+    anywhere in this module.
+    """
+    return Pipeline(
+        [
+            ("prep", ColumnTransformer(
+                [("num", "passthrough", list(numeric))], remainder="drop")),
+            ("clf", DummyClassifier(strategy="prior")),
+        ]
+    )
+
+
+def make_random_forest(
+    numeric: Sequence[str], categorical: Sequence[str]
+) -> Pipeline:
+    """Bagged trees, as a variance-reduction counterpoint to boosting.
+
+    Unlike ``HistGradientBoosting`` this cannot take NaN, so cold-start rows
+    are median-imputed and flagged.  The indicator columns matter more than the
+    imputed values: "this is a rookie" is the signal, and without the flag the
+    model would read a rookie as an average-risk driver.
+    """
+    steps: list[tuple[str, Any, list[str]]] = [
+        ("num",
+         SimpleImputer(strategy="median", add_indicator=True),
+         list(numeric)),
+    ]
+    if categorical:
+        steps.append(
+            ("cat", OneHotEncoder(handle_unknown="ignore", drop="first"),
+             list(categorical))
+        )
+    return Pipeline(
+        [
+            ("prep", ColumnTransformer(steps, remainder="drop")),
+            (
+                "clf",
+                RandomForestClassifier(
+                    n_estimators=500,
+                    min_samples_leaf=15,
+                    max_features="sqrt",
+                    n_jobs=-1,
+                    random_state=config.RANDOM_SEED,
+                ),
+            ),
+        ]
+    )
+
+
+def make_xgboost(numeric: Sequence[str], categorical: Sequence[str]) -> Pipeline:
+    """Gradient boosting via XGBoost, which also routes NaN natively.
+
+    Kept deliberately close to :func:`make_gradient_boosting` in depth and
+    learning rate: the point of running both is to see whether the result is
+    an artefact of one implementation's defaults, not to hyper-tune either.
+    """
+    from xgboost import XGBClassifier
+
+    steps: list[tuple[str, Any, list[str]]] = [("num", "passthrough", list(numeric))]
+    if categorical:
+        steps.append(
+            ("cat", OneHotEncoder(handle_unknown="ignore", drop="first"),
+             list(categorical))
+        )
+    return Pipeline(
+        [
+            ("prep", ColumnTransformer(steps, remainder="drop")),
+            (
+                "clf",
+                XGBClassifier(
+                    n_estimators=400,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    min_child_weight=10,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    reg_lambda=1.0,
+                    eval_metric="logloss",
+                    tree_method="hist",
+                    random_state=config.RANDOM_SEED,
+                ),
+            ),
+        ]
+    )
+
+
 MODEL_FACTORIES = {
+    "baseline": make_baseline,
     "logistic": make_logistic,
+    "random_forest": make_random_forest,
     "gradient_boosting": make_gradient_boosting,
+    "xgboost": make_xgboost,
 }
 
 
@@ -268,19 +364,9 @@ def walk_forward_evaluate(
     if target not in dataset.columns:
         raise KeyError(f"target {target!r} not in dataset")
 
-    available = set(dataset.columns)
-    selected = registry.feature_columns(stage, available=available)
-    selected = [c for c in [*selected, *extra_features] if c in available]
-    selected = [c for c in selected if c not in set(drop_features)]
-    if not selected:
-        raise ValueError(f"no registered features for stage {stage!r} in this dataset")
-
-    numeric = [
-        c for c in selected if registry.BY_NAME[c].kind in ("numeric", "binary")
-    ] if all(c in registry.BY_NAME for c in selected) else [
-        c for c in selected if pd.api.types.is_numeric_dtype(dataset[c])
-    ]
-    categorical = [c for c in selected if c not in numeric]
+    selected, numeric, categorical = _select_features(
+        dataset, stage, extra_features, drop_features
+    )
 
     seasons = sorted(dataset[season_col].dropna().unique())
     if test_seasons is None:
@@ -329,6 +415,152 @@ def walk_forward_evaluate(
 # --------------------------------------------------------------------------- #
 # Ablation and importance
 # --------------------------------------------------------------------------- #
+
+
+def _select_features(
+    dataset: pd.DataFrame,
+    stage: registry.Stage,
+    extra_features: Sequence[str],
+    drop_features: Sequence[str],
+) -> tuple[list[str], list[str], list[str]]:
+    """Resolve the registry selection into (all, numeric, categorical)."""
+    available = set(dataset.columns)
+    selected = registry.feature_columns(stage, available=available)
+    selected = [c for c in [*selected, *extra_features] if c in available]
+    selected = [c for c in selected if c not in set(drop_features)]
+    if not selected:
+        raise ValueError(f"no registered features for stage {stage!r} in this dataset")
+    numeric = (
+        [c for c in selected if registry.BY_NAME[c].kind in ("numeric", "binary")]
+        if all(c in registry.BY_NAME for c in selected)
+        else [c for c in selected if pd.api.types.is_numeric_dtype(dataset[c])]
+    )
+    categorical = [c for c in selected if c not in numeric]
+    return selected, numeric, categorical
+
+
+def walk_forward_races(
+    dataset: pd.DataFrame,
+    *,
+    stage: registry.Stage = "post_quali",
+    model: str = "random_forest",
+    target: str = TARGET,
+    min_train_rows: int = 400,
+    lookback_races: int | None = None,
+    refit_every: int = 1,
+    extra_features: Sequence[str] = (),
+    drop_features: Sequence[str] = (),
+    start_after: pd.Timestamp | str | None = None,
+) -> WalkForwardResult:
+    """Retrain before every race, the way the model would actually be run.
+
+    :func:`walk_forward_evaluate` refits once a season, which answers "how good
+    would this have been in 2025" but not "how good is it this Thursday".  In
+    service the model is refitted the moment the last race is classified, so
+    every race is scored by a model that has seen every race before it and none
+    after.  That is what this does, and it is the honest evaluation of a weekly
+    cadence: a season-level split gives the first race of a season the same
+    stale model as the last, which flatters early rounds and penalises late ones.
+
+    Args:
+        lookback_races: Train on only the most recent N races.  ``None`` uses
+            every prior race (an expanding window).  A sliding window trades
+            sample size for recency and is worth testing rather than assuming:
+            regulations change, and a 2018 row may be actively misleading about
+            a 2026 car.
+        refit_every: Refit every N races instead of every race.  ``1`` is the
+            operational cadence; larger values are only a cost saving.
+        start_after: Skip races on or before this date, so scoring starts once
+            the history is deep enough to be worth reporting.
+
+    Returns:
+        A :class:`WalkForwardResult` whose ``scores`` carry one row per season
+        (aggregated from the per-race predictions) and whose ``predictions``
+        carry every out-of-sample race.
+    """
+    if target not in dataset.columns:
+        raise KeyError(f"target {target!r} not in dataset")
+    if refit_every < 1:
+        raise ValueError("refit_every must be at least 1")
+
+    selected, numeric, categorical = _select_features(
+        dataset, stage, extra_features, drop_features
+    )
+
+    frame = dataset.copy()
+    frame[ORDER_COL] = pd.to_datetime(frame[ORDER_COL])
+    race_id = list(RACE_KEYS)
+    races = (
+        frame[[*race_id, ORDER_COL]]
+        .drop_duplicates()
+        .sort_values([ORDER_COL, *race_id], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    if start_after is not None:
+        races = races.loc[races[ORDER_COL] > pd.Timestamp(start_after)]
+
+    predictions: list[pd.DataFrame] = []
+    estimator = None
+    fitted_at = -1
+
+    for position, race in enumerate(races.itertuples(index=False)):
+        cutoff = getattr(race, ORDER_COL)
+        mask = dict(zip(race_id, (getattr(race, k) for k in race_id)))
+        is_race = np.ones(len(frame), dtype=bool)
+        for key, value in mask.items():
+            is_race &= (frame[key] == value).to_numpy()
+        test = frame.loc[is_race]
+        if test.empty:
+            continue
+
+        # Strictly earlier races only.  Same-day rows are excluded rather than
+        # ordered around: a sprint and its grand prix share a date, and letting
+        # Saturday inform Sunday here would be a different experiment from the
+        # one this function claims to run.
+        train = frame.loc[frame[ORDER_COL] < cutoff]
+        if lookback_races is not None and not train.empty:
+            keep = races.loc[races[ORDER_COL] < cutoff].tail(lookback_races)
+            if not keep.empty:
+                train = train.merge(keep[race_id], on=race_id, how="inner")
+        if len(train) < min_train_rows or train[target].nunique() < 2:
+            continue
+
+        if estimator is None or (position - fitted_at) >= refit_every:
+            estimator = MODEL_FACTORIES[model](numeric, categorical)
+            estimator.fit(train[selected], train[target])
+            fitted_at = position
+            base_rate = float(train[target].mean())
+            train_rows = len(train)
+
+        probability = estimator.predict_proba(test[selected])[:, 1]
+        block = test[[*race_id, target]].copy()
+        for column in ("DriverId", "TeamId", "EventName", ORDER_COL):
+            if column in test.columns:
+                block[column] = test[column]
+        block["predicted"] = probability
+        block["train_rows"] = train_rows
+        block["train_base_rate"] = base_rate
+        predictions.append(block)
+
+    if not predictions:
+        return WalkForwardResult(
+            scores=pd.DataFrame(), predictions=pd.DataFrame(),
+            features=selected, model_name=model,
+        )
+
+    out = pd.concat(predictions, ignore_index=True)
+    rows = []
+    for season, block in out.groupby("Year", observed=True):
+        score = score_predictions(
+            block[target], block["predicted"], float(block["train_base_rate"].mean())
+        )
+        score["season"] = int(season)
+        rows.append(score)
+    scores = pd.DataFrame(rows)
+    scores = scores[["season", *[c for c in scores.columns if c != "season"]]]
+    return WalkForwardResult(
+        scores=scores, predictions=out, features=selected, model_name=model
+    )
 
 
 def ablate_features(

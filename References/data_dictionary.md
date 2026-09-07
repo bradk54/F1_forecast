@@ -45,7 +45,7 @@ and every earlier one.
 > retirement risk weather explains.
 
 
-## `pre_weekend` features (77)
+## `pre_weekend` features (99)
 
 | feature | kind | description |
 | --- | --- | --- |
@@ -64,6 +64,14 @@ and every earlier one.
 | `team_dnf_rate_career` | numeric | Team's per-car retirement rate over every prior race. |
 | `teammate_dnf_rate_10` | numeric | The other car's own prior-race retirement rate. Two cars share a power unit and a design office, so the sister car carries information this driver's record does not. |
 | `team_races_this_season` | numeric | Races the team has completed this season; low values mean a car still early in its reliability shakedown. |
+| `team_points_rate_5` | numeric | Team's mean points per race over its previous 5 races. |
+| `team_points_rate_10` | numeric | Team's mean points per race over its previous 10 races. |
+| `team_points_rate_career` | numeric | Team's mean points per race over every prior race in the dataset. |
+| `team_form_delta` | numeric | team_points_rate_5 minus team_points_rate_career; positive when the team is scoring above its own historical rate, which is what a working upgrade looks like before it reaches the standings. |
+| `team_avg_finish_5` | numeric | Team's mean finishing position over its previous 5 races, taken over finishers only (a retirement has no position). |
+| `team_best_finish_5` | numeric | Team's best finishing position over its previous 5 races. |
+| `team_avg_grid_5` | numeric | Team's mean grid position over its previous 5 races: single-lap pace, the cleanest available proxy for car speed. |
+| `team_avg_grid_10` | numeric | Team's mean grid position over its previous 10 races. |
 | `pair_races_to_date` | numeric | Races this driver has started for this team. |
 | `is_new_pairing` | binary | 1 for the first five races of a driver-team combination. |
 | `pair_dnf_rate_10` | numeric | Retirement rate of this driver-team pairing over its previous 10 races. |
@@ -126,11 +134,27 @@ and every earlier one.
 | `field_size` | numeric | Cars taking the start. |
 | `days_since_last_race` | numeric | Days since this driver's previous race. |
 | `regulation_era` | categorical | Technical-regulation era; 2022 onward is the ground-effect ruleset. |
+| `field_dnf_rate_last_3` | numeric | Mean retirement rate across the whole grid over the previous 3 races. |
+| `field_dnf_rate_last_5` | numeric | Mean retirement rate across the whole grid over the previous 5 races. One number per race, shared by every driver in it. |
+| `field_dnf_rate_last_10` | numeric | Mean retirement rate across the whole grid over the previous 10 races. |
+| `field_dnf_rate_ewma` | numeric | Exponentially weighted grid retirement rate, 3-race half-life, so last weekend counts for roughly four times a race six weekends ago. |
+| `driver_dnf_rate_3` | numeric | Driver's retirement rate over their previous 3 races. |
+| `driver_dnf_ewma` | numeric | Exponentially weighted driver retirement rate, 3-race half-life. |
+| `driver_dnf_rate_season` | numeric | Driver's retirement rate so far this season only.  Resets at the winter break: a new car is a new reliability question. |
+| `team_dnf_rate_3` | numeric | Team's retirement rate over its previous 3 races. |
+| `team_dnf_ewma` | numeric | Exponentially weighted team retirement rate, 3-race half-life. |
+| `field_dnf_rate_mean` | numeric | Mean of every starter's driver_dnf_rate_10 for this race: how fragile this particular field is on recent form. |
+| `driver_dnf_rate_vs_field` | numeric | Driver's 10-race retirement rate minus the field mean; a 20% rate means something different on a fragile grid than on a robust one. |
+| `field_pace_spread` | numeric | Standard deviation of team_points_rate_5 across the grid.  A compressed field races closer together, which is where contact comes from. |
+| `team_rank_in_field` | numeric | Team's percentile rank by team_points_rate_5 within this race, 0 for the fastest car.  Relative pace travels across eras where the raw points rate does not. |
+| `season_progress` | numeric | Round number as a fraction of the season's rounds.  Late-season cars are developed and understood; early-season ones are neither. |
 
-## `post_quali` features (5)
+## `post_quali` features (7)
 
 | feature | kind | description |
 | --- | --- | --- |
+| `teammate_grid_delta` | numeric | This driver's grid slot minus the other car's, negative when ahead.  The team mate is the only genuine control for car quality in the sport: same machinery, same weekend. |
+| `driver_grid_vs_teammate_5` | numeric | Rolling mean of teammate_grid_delta over the driver's previous 5 races: much closer to a measure of the driver than raw grid position, which mostly measures the car. |
 | `grid_position` | numeric | Starting position, with a pit-lane start moved to the back of the grid. |
 | `grid_position_pct` | numeric | Grid position as a fraction of field size, so seasons with different entry counts are comparable. |
 | `is_back_half_of_grid` | binary | Starting in the slower half of the field. |

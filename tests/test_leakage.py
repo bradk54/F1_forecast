@@ -20,6 +20,7 @@ from src.features.build_features import (
     prior_rolling,
     races_since,
 )
+from src.features.labels import add_race_outcome_labels
 
 
 def test_shipped_builder_is_clean(labelled_results: pd.DataFrame) -> None:
@@ -248,3 +249,171 @@ def test_event_ordinal_separates_sprint_from_race(sprint_results) -> None:
     race_ord = weekend.loc[weekend["session_type"] == "R", "_ord"].unique()
     assert len(sprint_ord) == 1 and len(race_ord) == 1
     assert sprint_ord[0] < race_ord[0]  # Saturday before Sunday
+
+
+# --------------------------------------------------------------------------- #
+# Team competitiveness, team-mate comparison and field composition
+# --------------------------------------------------------------------------- #
+#
+# These read Points, Position and GridPosition -- all of which describe the
+# current race -- so they are the builders most able to leak. Each column below
+# must depend only on races strictly before the one it sits on.
+
+
+NEW_TEAM_FEATURES = (
+    "team_points_rate_5",
+    "team_points_rate_10",
+    "team_points_rate_career",
+    "team_form_delta",
+    "team_avg_finish_5",
+    "team_best_finish_5",
+    "team_avg_grid_5",
+    "team_avg_grid_10",
+)
+
+NEW_FIELD_FEATURES = (
+    "field_dnf_rate_mean",
+    "driver_dnf_rate_vs_field",
+    "field_pace_spread",
+    "team_rank_in_field",
+    "season_progress",
+)
+
+
+def test_new_features_are_all_present(labelled_results: pd.DataFrame) -> None:
+    built = build_history_features(labelled_results)
+    expected = (
+        *NEW_TEAM_FEATURES,
+        *NEW_FIELD_FEATURES,
+        "teammate_grid_delta",
+        "driver_grid_vs_teammate_5",
+    )
+    missing = [c for c in expected if c not in built.columns]
+    assert not missing, missing
+
+
+def test_team_performance_does_not_read_the_current_race(
+    labelled_results: pd.DataFrame,
+) -> None:
+    """Rewrite every Points value; the prior-race features must not move."""
+    baseline = build_history_features(labelled_results)
+
+    perturbed = labelled_results.copy()
+    last = perturbed["RaceDate"] == perturbed["RaceDate"].max()
+    perturbed.loc[last, "Points"] = 999.0
+    after = build_history_features(perturbed)
+
+    for column in NEW_TEAM_FEATURES:
+        pd.testing.assert_series_equal(
+            baseline.loc[last.to_numpy(), column],
+            after.loc[last.to_numpy(), column],
+            check_names=False,
+            obj=column,
+        )
+
+
+def test_team_points_rate_matches_a_hand_computation() -> None:
+    """Two teams, four races: the rolling mean is checked against arithmetic."""
+    rows = []
+    for rnd, points in enumerate([(10.0, 6.0), (20.0, 2.0), (0.0, 8.0), (4.0, 4.0)], 1):
+        for team, pts in zip(("alpha", "beta"), points):
+            for i in range(2):  # two cars per team
+                rows.append(
+                    {
+                        "Year": 2022,
+                        "RoundNumber": rnd,
+                        "RaceDate": pd.Timestamp("2022-03-01")
+                        + pd.Timedelta(days=14 * rnd),
+                        "session_type": "R",
+                        "DriverId": f"{team}_{i}",
+                        "TeamId": team,
+                        "Status": "Finished",
+                        "ClassifiedPosition": "1",
+                        "Points": pts / 2,
+                        "Position": 1.0,
+                        "GridPosition": 1.0,
+                    }
+                )
+    frame = add_race_outcome_labels(pd.DataFrame(rows), warn_on_unmapped=False)
+    built = build_history_features(frame)
+
+    alpha = built.loc[built["TeamId"] == "alpha"].sort_values("RoundNumber")
+    # Team totals per race are 10, 20, 0, 4.  Round 1 has no prior race.
+    assert alpha.loc[alpha["RoundNumber"] == 1, "team_points_rate_5"].isna().all()
+    assert alpha.loc[alpha["RoundNumber"] == 2, "team_points_rate_5"].eq(10.0).all()
+    assert alpha.loc[alpha["RoundNumber"] == 3, "team_points_rate_5"].eq(15.0).all()
+    assert alpha.loc[alpha["RoundNumber"] == 4, "team_points_rate_5"].eq(10.0).all()
+
+
+def test_teammate_grid_delta_is_antisymmetric(labelled_results: pd.DataFrame) -> None:
+    """Two cars, one team: whatever one gains the other loses."""
+    built = build_history_features(labelled_results)
+    pairs = built.dropna(subset=["teammate_grid_delta"])
+    totals = pairs.groupby(
+        ["Year", "RoundNumber", "TeamId"], observed=True
+    )["teammate_grid_delta"].sum()
+    assert np.allclose(totals.to_numpy(), 0.0), "deltas within a team must cancel"
+
+
+def test_teammate_delta_is_nan_for_a_single_car_entry() -> None:
+    """A one-car team has nothing to compare against; NaN, not zero."""
+    rows = [
+        {
+            "Year": 2022, "RoundNumber": rnd,
+            "RaceDate": pd.Timestamp("2022-03-01") + pd.Timedelta(days=14 * rnd),
+            "session_type": "R", "DriverId": "solo", "TeamId": "lonely",
+            "Status": "Finished", "ClassifiedPosition": "1",
+            "Points": 1.0, "Position": 1.0, "GridPosition": 5.0,
+        }
+        for rnd in (1, 2, 3)
+    ]
+    frame = add_race_outcome_labels(pd.DataFrame(rows), warn_on_unmapped=False)
+    built = build_history_features(frame)
+    assert built["teammate_grid_delta"].isna().all()
+
+
+def test_field_context_reads_only_prior_race_features(
+    labelled_results: pd.DataFrame,
+) -> None:
+    """Field aggregates are built from rolling columns, so outcomes cannot move them."""
+    baseline = build_history_features(labelled_results)
+
+    perturbed = labelled_results.copy()
+    last = perturbed["RaceDate"] == perturbed["RaceDate"].max()
+    perturbed.loc[last, "dnf"] = 1 - perturbed.loc[last, "dnf"]
+    after = build_history_features(perturbed)
+
+    for column in NEW_FIELD_FEATURES:
+        pd.testing.assert_series_equal(
+            baseline.loc[last.to_numpy(), column],
+            after.loc[last.to_numpy(), column],
+            check_names=False,
+            obj=column,
+        )
+
+
+def test_season_progress_spans_the_season(labelled_results: pd.DataFrame) -> None:
+    built = build_history_features(labelled_results)
+    per_year = built.groupby("Year", observed=True)["season_progress"]
+    assert per_year.max().eq(1.0).all(), "the final round must be 1.0"
+    assert (per_year.min() > 0).all()
+
+
+def test_team_rank_in_field_is_a_percentile(labelled_results: pd.DataFrame) -> None:
+    built = build_history_features(labelled_results)
+    rank = built["team_rank_in_field"].dropna()
+    assert rank.between(0, 1).all()
+
+
+def test_new_features_survive_the_full_leakage_detector(
+    labelled_results: pd.DataFrame,
+) -> None:
+    """The shipped detector, run over a frame that now carries the new columns."""
+    built = build_history_features(labelled_results)
+    report = detect_target_leakage(built)
+    flagged = set(report["feature"]) if not report.empty else set()
+    overlap = flagged.intersection(
+        {*NEW_TEAM_FEATURES, *NEW_FIELD_FEATURES,
+         "teammate_grid_delta", "driver_grid_vs_teammate_5"}
+    )
+    assert not overlap, sorted(overlap)

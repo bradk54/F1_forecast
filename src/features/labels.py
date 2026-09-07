@@ -41,6 +41,18 @@ single-car incident and ``Collision`` denotes contact between cars.  Any status
 string the rules do not recognise lands in ``other`` and is reported by
 :func:`unmapped_statuses`, so new vocabulary never fails silently.
 
+**The cause vocabulary stops in 2023.**  From that season the Jolpica backend
+returns a bare ``Retired`` for every retirement: Verstappen's brake fire at
+Australia 2024 and Leclerc's engine failure at Bahrain 2023 both arrive as
+``Retired`` and nothing else.  2018-2022 carry the real vocabulary
+(``Engine``, ``Collision``, ``Brakes``, ...), 2024 and 2025 are 100%
+``Retired``.  So ``dnf`` remains valid across the whole window -- a retirement
+is still a retirement -- but ``dnf_cause``, ``dnf_mechanical`` and
+``dnf_incident`` are only populated up to 2022, and any cause-specific work is
+confined to a five-season window whether or not that is enough data.  This is
+upstream data loss, not a mapping gap; extending :data:`_CAUSE_RULES` cannot
+recover it.
+
 A *blank* status is a different problem, and one these rules cannot solve: with
 no cause to read, the row falls into ``other`` and is labelled ``dnf=1`` on no
 evidence.  :func:`has_usable_status` is the predicate for "this row has a status
@@ -137,7 +149,10 @@ _CAUSE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
             r"\b(?:electr|hydraul|overheat|pneumatic|vibrat|mechanic|"
             r"technical|puncture|transmiss)"
             # Whole words and multi-word phrases.
-            r"|\b(?:engine|power\s*unit|ers|energy\s*store|turbo|battery|mgu"
+            # "Power loss" and "Power Unit" are both the power unit; the first
+            # is what Jolpica returns when it does not name the component.
+            r"|\b(?:engine|power\s*unit|power\s*loss|loss\s*of\s*power"
+            r"|ers|energy\s*store|turbo|battery|mgu"
             r"|mgu-?[hk]|gearbox|clutch|driveshaft|halfshaft|differential"
             r"|alternator|ignition|injection|distributor|magneto"
             r"|brakes?|suspension|steering|track\s*rod|wheels?|wheel\s*nut"

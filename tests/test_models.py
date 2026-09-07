@@ -12,10 +12,12 @@ import pandas as pd
 import pytest
 
 from src.models.train import (
+    MODEL_FACTORIES,
     calibration_slope,
     race_bootstrap,
     score_predictions,
     walk_forward_evaluate,
+    walk_forward_races,
 )
 
 
@@ -100,11 +102,37 @@ def test_post_quali_stage_includes_grid_position(modelling_dataset) -> None:
     assert "grid_position" in result.features
 
 
-def test_both_model_families_run(modelling_dataset) -> None:
-    for model in ("logistic", "gradient_boosting"):
-        result = walk_forward_evaluate(modelling_dataset, model=model)
-        assert not result.scores.empty, model
-        assert result.predictions["predicted"].between(0, 1).all(), model
+@pytest.mark.parametrize("model", sorted(MODEL_FACTORIES))
+def test_every_model_family_runs(modelling_dataset, model: str) -> None:
+    result = walk_forward_evaluate(modelling_dataset, model=model)
+    assert not result.scores.empty, model
+    assert result.predictions["predicted"].between(0, 1).all(), model
+
+
+def test_baseline_predicts_one_constant_per_fold(modelling_dataset) -> None:
+    """The reference model must be exactly that: the training base rate.
+
+    If this ever varies within a season, the comparison every other model is
+    judged against has stopped being a base rate.
+    """
+    result = walk_forward_evaluate(modelling_dataset, model="baseline")
+    per_season = result.predictions.groupby("Year", observed=True)["predicted"].nunique()
+    assert (per_season == 1).all()
+
+
+def test_baseline_scores_no_skill(modelling_dataset) -> None:
+    """Zero Brier skill by construction, and no ranking information at all."""
+    summary = walk_forward_evaluate(modelling_dataset, model="baseline").summary()
+    assert abs(summary["brier_skill"]) < 1e-6
+    assert summary["roc_auc"] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_random_forest_handles_cold_start_nans(modelling_dataset) -> None:
+    """RandomForest cannot take NaN natively; the imputer must cover every row."""
+    frame = modelling_dataset.copy()
+    frame.loc[frame.index[:50], "driver_dnf_rate_10"] = np.nan
+    result = walk_forward_evaluate(frame, model="random_forest")
+    assert result.predictions["predicted"].notna().all()
 
 
 def test_drop_features_removes_them(modelling_dataset) -> None:
@@ -128,3 +156,86 @@ def test_race_bootstrap_resamples_whole_races(modelling_dataset) -> None:
 def test_missing_target_raises(modelling_dataset) -> None:
     with pytest.raises(KeyError, match="target"):
         walk_forward_evaluate(modelling_dataset, target="not_a_column")
+
+
+# --------------------------------------------------------------------------- #
+# Race-by-race retraining
+# --------------------------------------------------------------------------- #
+#
+# The operational cadence: refit the moment the last race is classified, so
+# every race is scored by a model that has seen every race before it and none
+# after. A season-level split cannot express that, and flatters early rounds.
+
+
+def test_race_walk_forward_never_trains_on_the_future(modelling_dataset) -> None:
+    result = walk_forward_races(modelling_dataset, model="logistic")
+    assert not result.predictions.empty
+    # Every scored race must have been preceded by the rows it trained on.
+    races = (
+        modelling_dataset[["Year", "RoundNumber", "RaceDate"]]
+        .drop_duplicates()
+        .sort_values("RaceDate")
+    )
+    order = {(r.Year, r.RoundNumber): i for i, r in enumerate(races.itertuples())}
+    for row in result.predictions.itertuples():
+        # A race can only be scored once history exists before it.
+        assert order[(row.Year, row.RoundNumber)] > 0
+
+
+def test_every_scored_race_is_scored_exactly_once(modelling_dataset) -> None:
+    result = walk_forward_races(modelling_dataset, model="logistic")
+    counts = result.predictions.groupby(
+        ["Year", "RoundNumber", "DriverId"], observed=True
+    ).size()
+    assert counts.max() == 1
+
+
+def test_training_set_grows_with_every_race(modelling_dataset) -> None:
+    """The expanding window must actually expand."""
+    result = walk_forward_races(modelling_dataset, model="logistic")
+    per_race = (
+        result.predictions.groupby(["Year", "RoundNumber"], observed=True)["train_rows"]
+        .first()
+        .sort_index()
+    )
+    assert per_race.is_monotonic_increasing
+    assert per_race.iloc[-1] > per_race.iloc[0]
+
+
+def test_lookback_caps_the_training_window(modelling_dataset) -> None:
+    """A sliding window must stop growing once it is full."""
+    # min_train_rows has to come down with the window, or nothing is scored.
+    result = walk_forward_races(
+        modelling_dataset, model="logistic", lookback_races=5, min_train_rows=50
+    )
+    assert not result.predictions.empty
+    train_rows = result.predictions["train_rows"]
+    full = walk_forward_races(modelling_dataset, model="logistic", min_train_rows=50)
+    assert train_rows.max() < full.predictions["train_rows"].max()
+    # Five races of a fixed-size field is a bounded number of rows.
+    per_race = modelling_dataset.groupby(
+        ["Year", "RoundNumber"], observed=True
+    ).size().max()
+    assert train_rows.max() <= 5 * per_race
+
+
+def test_refit_every_reduces_the_number_of_fits(modelling_dataset) -> None:
+    """Refitting less often must reuse a model across races, not silently refit."""
+    often = walk_forward_races(modelling_dataset, model="logistic", refit_every=1)
+    rarely = walk_forward_races(modelling_dataset, model="logistic", refit_every=5)
+    assert rarely.predictions["train_rows"].nunique() < often.predictions[
+        "train_rows"
+    ].nunique()
+
+
+def test_race_walk_forward_reports_per_season_scores(modelling_dataset) -> None:
+    result = walk_forward_races(modelling_dataset, model="logistic")
+    assert not result.scores.empty
+    assert "season" in result.scores.columns
+    assert result.predictions["predicted"].between(0, 1).all()
+
+
+def test_start_after_skips_early_races(modelling_dataset) -> None:
+    cutoff = modelling_dataset["RaceDate"].quantile(0.5)
+    result = walk_forward_races(modelling_dataset, model="logistic", start_after=cutoff)
+    assert (result.predictions["RaceDate"] > cutoff).all()
