@@ -100,6 +100,31 @@ FEATURES: tuple[Feature, ...] = (
        "Races the team has completed this season; low values mean a car still "
        "early in its reliability shakedown.", allows_cold_start_nan=False),
 
+    # ---- team competitiveness (pre-weekend) -------------------------------
+    # Reliability says how often the car breaks; these say how fast it is.
+    # A slow car spends the race being lapped and passed, which is where
+    # contact happens, so pace moves retirement risk on its own.
+    _f("team_points_rate_5", "pre_weekend", "numeric",
+       "Team's mean points per race over its previous 5 races."),
+    _f("team_points_rate_10", "pre_weekend", "numeric",
+       "Team's mean points per race over its previous 10 races."),
+    _f("team_points_rate_career", "pre_weekend", "numeric",
+       "Team's mean points per race over every prior race in the dataset."),
+    _f("team_form_delta", "pre_weekend", "numeric",
+       "team_points_rate_5 minus team_points_rate_career; positive when the "
+       "team is scoring above its own historical rate, which is what a "
+       "working upgrade looks like before it reaches the standings."),
+    _f("team_avg_finish_5", "pre_weekend", "numeric",
+       "Team's mean finishing position over its previous 5 races, taken over "
+       "finishers only (a retirement has no position)."),
+    _f("team_best_finish_5", "pre_weekend", "numeric",
+       "Team's best finishing position over its previous 5 races."),
+    _f("team_avg_grid_5", "pre_weekend", "numeric",
+       "Team's mean grid position over its previous 5 races: single-lap pace, "
+       "the cleanest available proxy for car speed."),
+    _f("team_avg_grid_10", "pre_weekend", "numeric",
+       "Team's mean grid position over its previous 10 races."),
+
     # ---- pairing (pre-weekend) --------------------------------------------
     _f("pair_races_to_date", "pre_weekend", "numeric",
        "Races this driver has started for this team.", allows_cold_start_nan=False),
@@ -237,7 +262,35 @@ FEATURES: tuple[Feature, ...] = (
        "Technical-regulation era; 2022 onward is the ground-effect ruleset.",
        allows_cold_start_nan=False),
 
+    # ---- field composition (pre-weekend) ----------------------------------
+    # Attrition is partly a property of the grid rather than of any one car.
+    _f("field_dnf_rate_mean", "pre_weekend", "numeric",
+       "Mean of every starter's driver_dnf_rate_10 for this race: how fragile "
+       "this particular field is on recent form."),
+    _f("driver_dnf_rate_vs_field", "pre_weekend", "numeric",
+       "Driver's 10-race retirement rate minus the field mean; a 20% rate "
+       "means something different on a fragile grid than on a robust one."),
+    _f("field_pace_spread", "pre_weekend", "numeric",
+       "Standard deviation of team_points_rate_5 across the grid.  A "
+       "compressed field races closer together, which is where contact "
+       "comes from."),
+    _f("team_rank_in_field", "pre_weekend", "numeric",
+       "Team's percentile rank by team_points_rate_5 within this race, 0 for "
+       "the fastest car.  Relative pace travels across eras where the raw "
+       "points rate does not."),
+    _f("season_progress", "pre_weekend", "numeric",
+       "Round number as a fraction of the season's rounds.  Late-season cars "
+       "are developed and understood; early-season ones are neither."),
+
     # ---- qualifying-dependent (post-quali) --------------------------------
+    _f("teammate_grid_delta", "post_quali", "numeric",
+       "This driver's grid slot minus the other car's, negative when ahead.  "
+       "The team mate is the only genuine control for car quality in the "
+       "sport: same machinery, same weekend."),
+    _f("driver_grid_vs_teammate_5", "post_quali", "numeric",
+       "Rolling mean of teammate_grid_delta over the driver's previous 5 "
+       "races: much closer to a measure of the driver than raw grid position, "
+       "which mostly measures the car."),
     _f("grid_position", "post_quali", "numeric",
        "Starting position, with a pit-lane start moved to the back of the grid.",
        allows_cold_start_nan=False),
