@@ -95,8 +95,12 @@ Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Interme
   units) — and on 2026 held out, a **sliding `lookback_races=40` window beat the
   expanding window on every metric**: Brier skill +0.021 → +0.049, calibration
   slope 0.59 → 0.75, and it is the only configuration whose Brier improvement
-  over the base rate clears zero. Roughly 40-60 races (2-3 seasons) is the
-  measured sweet spot; the full nine-season history is actively harmful.
+  over the base rate clears zero. `DEFAULT_LOOKBACK_RACES = 40` is now the
+  default, and it is a bet rather than a free win: it beats an expanding window
+  on 2026 and *loses* on 2024 and 2025, both settled seasons (AUC 0.643→0.603
+  and 0.614→0.558). The bet is that a short window is the right posture going
+  into a regime change, when you cannot yet know one has begun. Re-check it each
+  season; in a settled formula the best window is probably longer.
   The short-window and EWMA *features* are, by contrast, close to neutral —
   keep them, but do not credit them for this.
 - **Sprints inform history but are not modelling rows.** A 100 km sprint and a 305 km grand prix do not share an attrition process.
