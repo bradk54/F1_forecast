@@ -19,6 +19,7 @@ from src.features.labels import (
     WITHDRAWN,
     add_race_outcome_labels,
     classify_status,
+    has_usable_status,
     label_summary,
     unmapped_statuses,
 )
@@ -101,6 +102,67 @@ def test_unmapped_statuses_reports_new_vocabulary() -> None:
     counts = unmapped_statuses(["Finished", "Engine", "Flux capacitor", "Flux capacitor"])
     assert counts.get("Flux capacitor") == 2
     assert "Engine" not in counts.index
+
+
+# --------------------------------------------------------------------------- #
+# Blank statuses
+# --------------------------------------------------------------------------- #
+#
+# A blank Status is not new vocabulary, it is absent data, and the two need
+# different handling: unmapped_statuses counts strings, so it cannot see a
+# blank, while a blank silently becomes dnf=1.  A rate-limited Ergast call
+# produces a whole session of them.
+
+
+@pytest.mark.parametrize(
+    ("value", "usable"),
+    [
+        ("Finished", True),
+        ("Engine", True),
+        ("+ 1 Lap", True),
+        ("", False),
+        ("   ", False),
+        ("\t", False),
+        (None, False),
+        (float("nan"), False),
+    ],
+)
+def test_has_usable_status(value, usable: bool) -> None:
+    assert bool(has_usable_status(pd.Series([value])).iloc[0]) is usable
+
+
+def test_unmapped_statuses_cannot_see_a_blank_status() -> None:
+    """Why the blank case needs its own signal rather than reusing this one."""
+    assert unmapped_statuses(["", "  ", ""]).empty
+
+
+def test_a_blank_status_becomes_an_unevidenced_dnf() -> None:
+    """The bug the guard exists for, pinned so a fix elsewhere cannot hide it."""
+    frame = pd.DataFrame(
+        {"Status": [""] * 5, "ClassifiedPosition": [str(i + 1) for i in range(5)]}
+    )
+    labelled = add_race_outcome_labels(frame, warn_on_unmapped=False)
+    assert labelled["dnf"].mean() == 1.0, "a blank status still reads as a retirement"
+
+
+def test_blank_statuses_are_warned_about(caplog) -> None:
+    frame = pd.DataFrame(
+        {"Status": ["Finished", "", "Engine", "   "], "ClassifiedPosition": list("1234")}
+    )
+    with caplog.at_level("WARNING", logger="src.features.labels"):
+        add_race_outcome_labels(frame)
+
+    assert "2 of 4 row(s) carry no finishing status" in caplog.text
+
+
+def test_a_healthy_frame_warns_about_nothing(caplog) -> None:
+    frame = pd.DataFrame(
+        {"Status": ["Finished", "Engine"], "ClassifiedPosition": ["1", "R"]}
+    )
+    with caplog.at_level("WARNING", logger="src.features.labels"):
+        add_race_outcome_labels(frame)
+
+    assert "no finishing status" not in caplog.text
 
 
 @pytest.fixture

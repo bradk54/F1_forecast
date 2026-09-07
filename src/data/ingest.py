@@ -15,6 +15,13 @@ Three practical notes about running it:
   events are cancelled, and the 2020 season is missing races that were
   scheduled and never run.  Every loader collects failures into a report
   rather than aborting, so one bad session does not cost a whole season.
+* **A load can succeed and still be useless.**  ``Status`` comes from Ergast,
+  not from F1 timing, and ``Session.load`` swallows an Ergast failure -- a
+  rate-limited round yields a full grid of drivers with a blank ``Status``,
+  which the labeller would read as an all-retirement race.
+  :func:`extract_results` rejects such a frame with
+  :class:`DegradedResultsError` so it lands in the report instead of the
+  dataset.
 * **Egress may be blocked.**  ``livetiming.formula1.com`` and ``api.jolpi.ca``
   are refused outright by some corporate and sandboxed networks.
   :func:`check_connectivity` reports that clearly instead of leaving you to
@@ -33,6 +40,7 @@ import numpy as np
 import pandas as pd
 
 from src import config
+from src.features.labels import has_usable_status
 from src.features.track_profile import build_lap_profile
 
 log = logging.getLogger(__name__)
@@ -51,6 +59,30 @@ RESULT_COLUMNS = (
     "Position", "ClassifiedPosition", "GridPosition",
     "Status", "Points", "Laps", "Time",
 )
+
+
+#: Sessions whose results are expected to carry an Ergast ``Status``.  The
+#: quali-like sprint sessions are not among them: Ergast has no results for
+#: those, and FastF1 says so explicitly when it falls back to timing data.
+STATUS_BEARING_SESSIONS = frozenset({"R", "S"})
+
+
+class DegradedResultsError(RuntimeError):
+    """A session loaded, but its results carry no finishing status at all.
+
+    Raised rather than returning the rows, because the rows are worse than
+    useless: :func:`src.features.labels.add_race_outcome_labels` reads a blank
+    ``Status`` as a retirement, so accepting them writes a round in which every
+    driver retired.  Failing here puts the round in the :class:`IngestReport`
+    instead, where it can be re-pulled.
+
+    The usual cause is HTTP 429 from ``api.jolpi.ca``.  FastF1's
+    ``ergast/interface.py::_get`` raises ``ErgastInvalidRequestError`` on any
+    non-200, ``Session.load`` catches it, logs "No result data for this session
+    available on Ergast!" at WARNING and carries on with timing data alone --
+    so the load *succeeds*, with a full grid of drivers and an empty ``Status``
+    column.  Slow the pull down or retry the affected rounds.
+    """
 
 
 @dataclass
@@ -277,11 +309,46 @@ def optional_session_attr(session, name: str, default=np.nan):
     return default if value is None else value
 
 
-def extract_results(session, *, session_label: str = "R") -> pd.DataFrame:
-    """One row per driver from a loaded session, with event identity attached."""
+def extract_results(
+    session, *, session_label: str = "R", require_status: bool = True
+) -> pd.DataFrame:
+    """One row per driver from a loaded session, with event identity attached.
+
+    Args:
+        session: A loaded FastF1 session.
+        session_label: Value written to the ``session_type`` column.
+        require_status: Reject a results frame in which no row carries a
+            finishing status.  See :class:`DegradedResultsError` for why this
+            is a hard failure rather than a warning.
+
+    Raises:
+        DegradedResultsError: ``require_status`` is set, the session is one of
+            :data:`STATUS_BEARING_SESSIONS`, and its ``Status`` column is
+            missing or blank on every row.
+    """
     results = pd.DataFrame(session.results).copy()
     keep = [c for c in RESULT_COLUMNS if c in results.columns]
     frame = results[keep].reset_index(drop=True)
+
+    if (
+        require_status
+        and session_label in STATUS_BEARING_SESSIONS
+        and len(frame)
+    ):
+        # An absent column and an all-blank one have the same cause and the
+        # same consequence, so they get the same treatment.
+        usable = (
+            has_usable_status(frame["Status"])
+            if "Status" in frame.columns
+            else pd.Series(False, index=frame.index)
+        )
+        if not usable.any():
+            raise DegradedResultsError(
+                f"{len(frame)} driver row(s) but no finishing status on any of "
+                f"them -- the Ergast backend almost certainly rate-limited this "
+                f"session, so the rows are dropped rather than labelled as an "
+                f"all-retirement race"
+            )
 
     event = session.event
     frame["Year"] = int(event["EventDate"].year)
@@ -369,6 +436,13 @@ def collect_season_results(
                     frame[key] = value
                 frames.append(frame)
                 report.add_success(f"{label} [{session_type}]")
+            except DegradedResultsError as exc:
+                # Always reported, sprint included: unlike an absent sprint,
+                # this means the backend answered and the answer was unusable,
+                # which is worth seeing for every session it touched.
+                log.warning("degraded results for %s [%s]: %s",
+                            label, session_type, exc)
+                report.add_failure(f"{label} [{session_type}]", exc)
             except Exception as exc:  # noqa: BLE001
                 # A missing sprint is expected on most weekends; a missing race
                 # is worth seeing in the report.

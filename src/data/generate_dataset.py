@@ -8,7 +8,12 @@ The pipeline runs in four stages, each of which can be re-run on its own:
 3. **Labels and history.**  Outcome columns, then leakage-safe rolling
    reliability features.
 4. **Join and check.**  Merge the profiles onto the results, then run the
-   leakage detector and the registry audit before writing anything out.
+   leakage detector, the status-coverage check and the registry audit before
+   writing anything out.
+
+The CLI reports a failed check rather than writing a dataset that would fail
+it: exit 3 for detected leakage, exit 4 for a race that reached the modelling
+table with no finishing status on any row (see :func:`status_coverage`).
 
 The expensive stage is the second: it downloads telemetry for one session per
 event.  Its output is cached to parquet, so a rebuild that only changes feature
@@ -43,7 +48,11 @@ from src import config
 from src.data import circuits as circuits_mod
 from src.features import registry
 from src.features.build_features import build_history_features, detect_target_leakage
-from src.features.labels import add_race_outcome_labels, label_summary
+from src.features.labels import (
+    add_race_outcome_labels,
+    has_usable_status,
+    label_summary,
+)
 from src.features.track_profile import add_composite_indices, aggregate_circuit_profiles
 
 log = logging.getLogger(__name__)
@@ -223,6 +232,51 @@ def join_circuit_profiles(
     return out
 
 
+def status_coverage(frame: pd.DataFrame) -> pd.DataFrame:
+    """Per-race count of rows carrying a usable ``Status``.
+
+    The DNF label is derived from ``Status``, and a blank one is read as a
+    retirement, so a race that lost its status to a rate-limited Ergast call
+    arrives labelled as an all-retirement race with nothing raised.  This is
+    the dataset-level backstop for that: the ingest guard
+    (:class:`src.data.ingest.DegradedResultsError`) stops such rows being
+    collected in the first place, but it cannot help a parquet written before
+    the guard existed and re-read via ``--skip-download``.
+
+    Returns:
+        One row per race that is missing at least one status, with ``rows``,
+        ``with_status`` and ``status_share``, worst first.  Empty means every
+        row of every race carries a status -- the same "empty is a pass"
+        convention the leakage report uses.
+    """
+    if frame.empty or "Status" not in frame.columns:
+        return pd.DataFrame(
+            columns=["Year", "RoundNumber", "EventName", "rows",
+                     "with_status", "status_share"]
+        )
+
+    keys = [c for c in ("Year", "RoundNumber", "EventName") if c in frame.columns]
+    counted = frame.assign(_usable=has_usable_status(frame["Status"]).to_numpy())
+    if not keys:
+        # No race identity to group on.  Report the frame as a single unnamed
+        # race rather than passing it: the blanks still need to be seen.
+        counted = counted.assign(EventName="(unidentified)")
+        keys = ["EventName"]
+    per_race = (
+        counted.groupby(keys, observed=True)
+        .agg(rows=("_usable", "size"), with_status=("_usable", "sum"))
+        .reset_index()
+    )
+    per_race["with_status"] = per_race["with_status"].astype(int)
+    per_race["status_share"] = (
+        per_race["with_status"] / per_race["rows"]
+    ).round(4)
+    incomplete = per_race.loc[per_race["with_status"] < per_race["rows"]]
+    return incomplete.sort_values(
+        ["status_share", *keys]
+    ).reset_index(drop=True)
+
+
 def build_dataset(
     results: pd.DataFrame,
     profiles: pd.DataFrame | None = None,
@@ -287,11 +341,21 @@ def build_dataset(
     if run_checks:
         diagnostics["leakage"] = detect_target_leakage(started)
         diagnostics["registry_audit"] = registry.audit_coverage(dataset)
+        diagnostics["status_coverage"] = status_coverage(dataset)
         if not diagnostics["leakage"].empty:
             log.error(
                 "LEAKAGE DETECTED in %d feature(s):\n%s",
                 len(diagnostics["leakage"]),
                 diagnostics["leakage"].to_string(index=False),
+            )
+        blank_races = diagnostics["status_coverage"]
+        if not blank_races.empty:
+            log.error(
+                "%d race(s) are missing at least one finishing status; %d have "
+                "none at all and are labelled as all-retirement races:\n%s",
+                len(blank_races),
+                int((blank_races["with_status"] == 0).sum()),
+                blank_races.to_string(index=False),
             )
 
     return dataset, diagnostics
@@ -385,6 +449,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("\n=== leakage check: FAILED ===")
             print(leakage.to_string(index=False))
             return 3
+
+    coverage = diagnostics.get("status_coverage")
+    if coverage is not None:
+        rows_with_status = (
+            int(has_usable_status(dataset["Status"]).sum())
+            if "Status" in dataset.columns and not dataset.empty
+            else 0
+        )
+        if coverage.empty:
+            print(f"\n=== status check: PASS ({rows_with_status}/{len(dataset)} "
+                  f"rows carry a finishing status) ===")
+        else:
+            blank_races = coverage.loc[coverage["with_status"] == 0]
+            verdict = "FAILED" if not blank_races.empty else "DEGRADED"
+            print(f"\n=== status check: {verdict} "
+                  f"({rows_with_status}/{len(dataset)} rows carry a finishing "
+                  f"status; {len(coverage)} race(s) incomplete, "
+                  f"{len(blank_races)} with none at all) ===")
+            print(coverage.to_string(index=False))
+            if not blank_races.empty:
+                # Every row of these races is labelled dnf=1 on no evidence.
+                # Writing them would poison the target, so stop before _write.
+                print(
+                    "\nA race with no finishing status at all means the Ergast "
+                    "backend rate-limited that round; its rows are labelled as "
+                    "retirements on no evidence. Re-pull the listed rounds "
+                    "instead of writing this dataset."
+                )
+                return 4
 
     audit = diagnostics.get("registry_audit")
     if audit is not None and not audit.empty:

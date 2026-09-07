@@ -40,6 +40,12 @@ Cause mapping follows Ergast's status vocabulary, where ``Accident`` denotes a
 single-car incident and ``Collision`` denotes contact between cars.  Any status
 string the rules do not recognise lands in ``other`` and is reported by
 :func:`unmapped_statuses`, so new vocabulary never fails silently.
+
+A *blank* status is a different problem, and one these rules cannot solve: with
+no cause to read, the row falls into ``other`` and is labelled ``dnf=1`` on no
+evidence.  :func:`has_usable_status` is the predicate for "this row has a status
+at all"; the pipeline uses it to reject a degraded ingest outright rather than
+letting it reach the labels.
 """
 
 from __future__ import annotations
@@ -181,6 +187,30 @@ def classify_status(status: object) -> str:
     return OTHER
 
 
+def has_usable_status(statuses: object) -> pd.Series:
+    """Boolean mask: True where a finishing status is actually present.
+
+    Blank is not a status.  When the Ergast backend rate-limits, FastF1 logs a
+    warning, gives up on the result payload and returns a results frame whose
+    ``Status`` column is filled with **empty strings** -- not nulls, so
+    ``isna()`` reports nothing amiss.  Every such row then classifies as
+    :data:`OTHER`, which :func:`add_race_outcome_labels` reads as a retirement,
+    so a rate-limited round arrives labelled as a 100% DNF race.
+
+    This is the predicate both the ingest guard and the dataset-level check
+    are built on; see :func:`src.data.ingest.extract_results` and
+    :func:`src.data.generate_dataset.status_coverage`.
+    """
+    series = (
+        statuses
+        if isinstance(statuses, pd.Series)
+        else pd.Series(statuses, dtype="object")
+    )
+    return series.map(
+        lambda v: not pd.isna(v) and bool(str(v).strip())
+    ).astype(bool)
+
+
 def unmapped_statuses(statuses: Iterable[object]) -> pd.Series:
     """Count status strings that fell through to ``other``.
 
@@ -240,6 +270,7 @@ def add_race_outcome_labels(
 
     out = results.copy()
     status = out[status_col]
+    usable = has_usable_status(status)
 
     out["dnf_cause"] = status.map(classify_status).astype(
         pd.CategoricalDtype(categories=CAUSE_ORDER)
@@ -290,6 +321,20 @@ def add_race_outcome_labels(
     out["classified"] = out["classified"].astype("int8")
 
     if warn_on_unmapped:
+        # Blank statuses first: they are invisible to unmapped_statuses (which
+        # counts vocabulary, and blank is not vocabulary) but each one becomes
+        # a spurious dnf=1, so they are the more damaging of the two.
+        n_blank = int((~usable).sum())
+        if n_blank:
+            log.warning(
+                "%d of %d row(s) carry no finishing status; every one of them "
+                "is labelled dnf=1 on no evidence. A whole race missing its "
+                "status usually means the Ergast backend rate-limited the "
+                "ingest -- rebuild those rounds rather than trusting these "
+                "labels.",
+                n_blank,
+                len(out),
+            )
         leftovers = unmapped_statuses(status)
         if not leftovers.empty:
             log.warning(
