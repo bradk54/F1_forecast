@@ -25,5 +25,16 @@ tqdm>=4.66
 xgboost>=2.0             # points regressor in 2_0_Model_Development, and
                          # one of the DNF model families in models/train.py
 
+# Dashboard (app/) ---------------------------------------------------------
+# The local Streamlit app over the DNF pipeline; see app/README.md.  Neither is
+# imported by src/, so the pipeline and the tests still run without them.
+# Floors are the versions the app was built and tested against rather than
+# researched minimums: streamlit for the `width="stretch"` argument that
+# replaced `use_container_width`, plotly for `marker.cornerradius` on bar
+# traces.  Both are cheap to satisfy and a too-low floor fails at import.
+streamlit>=1.52
+plotly>=5.24
+
 # Development --------------------------------------------------------------
-pytest>=8.0
+pytest>=7.4              # the suite passes on 7.4; raise this only when
+                         # something in tests/ actually needs 8.x

@@ -17,6 +17,15 @@ Two properties of this log are worth stating because they change how it reads:
   never predicted.  :func:`src.models.train.score_predictions` takes the same
   view.
 
+* **``source`` says how a row was produced.**  ``live`` means the prediction
+  was made before the race and scored afterwards, which is the only kind that
+  proves the model works in service.  ``replay`` means it was reconstructed
+  after the fact by :mod:`scripts.backfill_model_log`, which refits before each
+  race exactly as service does but reads the *final* dataset build rather than
+  whatever was known that week.  Replayed rows are honest out-of-sample scores
+  and useless as evidence that the weekly loop is running -- keep them
+  separable rather than averaging the two together without saying so.
+
 The file is committed.  It is a few kilobytes, and the entire point is to be
 able to read drift out of the diff.
 """
@@ -53,7 +62,7 @@ PREDICTION_COLUMNS = (
 
 #: Column order, fixed so the CSV diffs cleanly.
 LOG_COLUMNS = (
-    "scored_at", "year", "round", "event", "race_date",
+    "scored_at", "source", "year", "round", "event", "race_date",
     "stage", "model", "git_sha",
     "train_rows", "train_base_rate", "lookback_races",
     "n", "observed_rate", "mean_predicted",
@@ -93,12 +102,19 @@ def score_race(
     train_rows: int,
     train_base_rate: float,
     lookback_races: int | None,
+    source: str = "live",
 ) -> dict:
-    """Build one log row from a race's outcomes and the predictions made for it."""
+    """Build one log row from a race's outcomes and the predictions made for it.
+
+    ``source`` defaults to ``live`` because that is the only way this function
+    is called in service: a prediction saved on Saturday, scored on Tuesday.  A
+    backfill passes ``replay`` so the two never get averaged together silently.
+    """
     scores = score_predictions(outcomes, predicted, train_base_rate)
     hits, lift = top_k_lift(outcomes, predicted)
     return {
         "scored_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": source,
         "year": int(year),
         "round": int(round_number),
         "event": event,
