@@ -4,6 +4,7 @@ f1-forecast-engine
 Forecasting Formula 1 outcomes. Two models live here:
 
 - **Points** (`Notebooks/2_0_Model_Development.ipynb`) — how many points will a driver score?
+  Design brief for the rebuild: `References/points_model_design.md`.
 - **Retirement** (`Notebooks/3_0_DNF_Dataset.ipynb`) — will a driver finish the race at all?
 
 ---

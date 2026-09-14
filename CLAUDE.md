@@ -82,6 +82,13 @@ src/models/predict.py         the CLI: refresh, next, race, status
 failure modes, and why running before qualifying is a different model rather
 than a less confident one. Read it before changing anything in `src/models/`.
 
+**`References/points_model_design.md` is the design brief for what comes next** —
+the exact current model and its (untuned, hand-set) hyperparameters, the lessons
+the DNF work actually produced, how to approach feature creation for a
+finishing-position model, and how to build a probabilistic per-race and
+season-long forecast on top of it. Read it before starting the points model;
+it exists so that work does not repeat the mistakes catalogued in it.
+
 Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Intermediates cache to `Data/processed/{race_results,circuit_profiles}.parquet`; the modelling table lands at `Data/processed/dnf_dataset.parquet`. `--skip-download` reuses those parquets; `--offline` rebuilds from the fastf1 cache without network.
 
 ### Rules that hold across this pipeline
