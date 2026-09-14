@@ -626,3 +626,193 @@ def test_one_bad_season_does_not_stop_the_others(monkeypatch) -> None:
     assert not frame.empty, "2025 should still have been collected"
     assert set(frame["Year"]) == {2025}
     assert any(label == "2024 schedule" for label, _ in report.failed)
+
+
+# --------------------------------------------------------------------------- #
+# Spending fewer requests
+# --------------------------------------------------------------------------- #
+#
+# Every test below is about one number: Ergast allows 500 calls an hour, and a
+# full rebuild used to attempt roughly 558 session loads.  What is pinned here
+# is that the work skipped is the work that could not have told us anything.
+
+
+class TestSprintsAreOnlyAttemptedWhenOneExists:
+    """186 events, 29 sprints.  The calendar already knows which is which."""
+
+    @pytest.mark.parametrize(
+        "fmt", ["sprint", "sprint_shootout", "sprint_qualifying", "SPRINT"]
+    )
+    def test_every_spelling_of_a_sprint_weekend_is_recognised(self, fmt) -> None:
+        assert ingest.event_has_sprint(pd.Series({"EventFormat": fmt}))
+
+    def test_a_conventional_weekend_is_not_attempted(self) -> None:
+        assert not ingest.event_has_sprint(pd.Series({"EventFormat": "conventional"}))
+
+    @pytest.mark.parametrize("value", [None, np.nan])
+    def test_an_unknown_format_is_still_attempted(self, value) -> None:
+        """A wasted request is cheaper than a silently dropped sprint."""
+        assert ingest.event_has_sprint(pd.Series({"EventFormat": value}))
+
+    def test_a_schedule_without_the_column_is_still_attempted(self) -> None:
+        assert ingest.event_has_sprint(pd.Series({"EventName": "Bahrain Grand Prix"}))
+
+    def test_the_sprint_session_is_never_opened_on_a_conventional_weekend(
+        self, monkeypatch
+    ) -> None:
+        schedule = pd.DataFrame({
+            "RoundNumber": [1, 2],
+            "EventName": ["Bahrain Grand Prix", "Monaco Grand Prix"],
+            "EventFormat": ["sprint", "conventional"],
+        })
+        module = types.ModuleType("fastf1")
+        module.get_event_schedule = lambda year, include_testing=False: schedule
+        monkeypatch.setitem(sys.modules, "fastf1", module)
+
+        attempted: list[tuple[int, str]] = []
+
+        def fake_load(year, event, session_type, **kwargs):
+            attempted.append((event, session_type))
+            return make_session(GOOD_STATUS, round_number=event,
+                                event_name=EVENT_NAMES[event])
+
+        monkeypatch.setattr(ingest, "load_session", fake_load)
+        monkeypatch.setattr(ingest, "extract_weather", lambda session: {})
+
+        ingest.collect_season_results(2024, report=IngestReport())
+
+        assert (1, "S") in attempted, "the sprint weekend's sprint was skipped"
+        assert (2, "S") not in attempted, "a sprint was requested for a conventional weekend"
+        assert [s for _, s in attempted].count("R") == 2, "both races must still load"
+
+
+class TestStoredCircuitProfilesAreReused:
+    """A layout in a past season cannot change, so re-deriving it is pure cost."""
+
+    @pytest.fixture
+    def schedule_module(self, monkeypatch):
+        schedule = pd.DataFrame({
+            "RoundNumber": [1, 2],
+            "EventName": ["Bahrain Grand Prix", "Monaco Grand Prix"],
+        })
+        module = types.ModuleType("fastf1")
+        module.get_event_schedule = lambda year, include_testing=False: schedule
+        monkeypatch.setitem(sys.modules, "fastf1", module)
+        return module
+
+    @staticmethod
+    def _results() -> pd.DataFrame:
+        return pd.DataFrame({
+            "Year": [2024, 2024],
+            "RoundNumber": [1, 2],
+            "circuit_key": [63.0, 22.0],
+        })
+
+    @staticmethod
+    def _stored() -> pd.DataFrame:
+        return pd.DataFrame([{"circuit_key": 63.0, "year": 2024, "lap_length_m": 5412.0}])
+
+    def test_a_stored_profile_is_carried_through_untouched(
+        self, monkeypatch, schedule_module
+    ) -> None:
+        derived: list[int] = []
+
+        def fake_profile(year, event, **kwargs):
+            derived.append(event)
+            return {"circuit_key": 22.0, "year": year, "lap_length_m": 3337.0}
+
+        monkeypatch.setattr(ingest, "profile_event", fake_profile)
+        profiles, report = ingest.collect_circuit_profiles(
+            [2024], existing=self._stored(), results=self._results()
+        )
+
+        assert derived == [2], "round 1 was already stored and must not be re-derived"
+        assert len(profiles) == 2, "the reused row must still reach the output"
+        assert set(profiles["circuit_key"]) == {63.0, 22.0}
+        assert len(report.loaded) == 1
+
+    def test_the_reused_row_keeps_its_stored_values(
+        self, monkeypatch, schedule_module
+    ) -> None:
+        monkeypatch.setattr(
+            ingest, "profile_event",
+            lambda year, event, **kw: {"circuit_key": 22.0, "year": year,
+                                       "lap_length_m": 3337.0},
+        )
+        profiles, _ = ingest.collect_circuit_profiles(
+            [2024], existing=self._stored(), results=self._results()
+        )
+        kept = profiles.loc[profiles["circuit_key"] == 63.0].iloc[0]
+        assert kept["lap_length_m"] == 5412.0
+
+    def test_without_a_results_mapping_nothing_can_be_skipped(
+        self, monkeypatch, schedule_module
+    ) -> None:
+        """The circuit key is what makes reuse decidable; no mapping, no reuse."""
+        derived: list[int] = []
+        monkeypatch.setattr(
+            ingest, "profile_event",
+            lambda year, event, **kw: derived.append(event) or {
+                "circuit_key": float(event), "year": year},
+        )
+        ingest.collect_circuit_profiles(
+            [2024], existing=self._stored(), results=None
+        )
+        assert derived == [1, 2]
+
+    def test_passing_no_existing_profiles_rebuilds_everything(
+        self, monkeypatch, schedule_module
+    ) -> None:
+        derived: list[int] = []
+        monkeypatch.setattr(
+            ingest, "profile_event",
+            lambda year, event, **kw: derived.append(event) or {
+                "circuit_key": float(event), "year": year},
+        )
+        ingest.collect_circuit_profiles(
+            [2024], existing=None, results=self._results()
+        )
+        assert derived == [1, 2], "existing=None is the documented full-rebuild path"
+
+    def test_a_layout_change_in_a_new_season_is_still_derived(
+        self, monkeypatch, schedule_module
+    ) -> None:
+        """Profiles are keyed on (circuit_key, year): 2025 is not 2024."""
+        derived: list[int] = []
+        monkeypatch.setattr(
+            ingest, "profile_event",
+            lambda year, event, **kw: derived.append(event) or {
+                "circuit_key": 63.0, "year": year},
+        )
+        results = pd.DataFrame({
+            "Year": [2025, 2025], "RoundNumber": [1, 2],
+            "circuit_key": [63.0, 22.0],
+        })
+        ingest.collect_circuit_profiles(
+            [2025], existing=self._stored(), results=results
+        )
+        assert derived == [1, 2], "a 2024 profile must not satisfy a 2025 round"
+
+
+class TestCircuitKeysByRound:
+    def test_it_maps_year_and_round_to_a_key(self) -> None:
+        frame = pd.DataFrame({
+            "Year": [2024, 2024, 2024],
+            "RoundNumber": [1, 1, 2],
+            "circuit_key": [63.0, 63.0, 22.0],
+        })
+        assert ingest.circuit_keys_by_round(frame) == {(2024, 1): 63.0, (2024, 2): 22.0}
+
+    @pytest.mark.parametrize("frame", [None, pd.DataFrame()])
+    def test_absent_results_give_an_empty_mapping(self, frame) -> None:
+        assert ingest.circuit_keys_by_round(frame) == {}
+
+    def test_a_frame_without_the_columns_gives_an_empty_mapping(self) -> None:
+        assert ingest.circuit_keys_by_round(pd.DataFrame({"Year": [2024]})) == {}
+
+    def test_rounds_with_no_key_are_dropped_rather_than_guessed(self) -> None:
+        frame = pd.DataFrame({
+            "Year": [2024, 2024], "RoundNumber": [1, 2],
+            "circuit_key": [63.0, np.nan],
+        })
+        assert ingest.circuit_keys_by_round(frame) == {(2024, 1): 63.0}
