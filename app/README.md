@@ -2,7 +2,15 @@
 
 A local Streamlit app over the retirement (DNF) pipeline in `src/`.
 
+**Double-click `Dashboard.command`** at the repository root. It starts the
+server and opens the browser; that Terminal window *is* the server, so closing
+it stops the app. Clicking it again while it is already running just reopens the
+browser rather than failing on the port.
+
+Or from a terminal, either of:
+
 ```bash
+./Dashboard.command
 ./.venv/bin/python -m streamlit run app/Home.py
 ```
 
