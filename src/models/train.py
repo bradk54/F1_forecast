@@ -267,6 +267,63 @@ def make_xgboost(numeric: Sequence[str], categorical: Sequence[str]) -> Pipeline
 #: in a settled formula the best window is probably longer.
 DEFAULT_LOOKBACK_RACES = 40
 
+#: Named subsets of the registry's stage selection.
+#:
+#: The registry says *when* a feature becomes knowable; a feature set says which
+#: of the knowable ones a model is allowed to use.  The two are separate axes
+#: and were conflated until measurement forced them apart.
+#:
+#: ``grid_only`` is not a toy.  Walked forward race by race over 2022-2026 it
+#: beats the 101-feature selection on every metric that matters:
+#:
+#: ===================  ======  ============  ===========
+#: features             AUC     Brier skill   calibration
+#: ===================  ======  ============  ===========
+#: grid_position only   0.583   +0.0091       0.803
+#: the full 101         0.565   +0.0057       0.606
+#: grid + team_dnf_10   0.563   +0.0038       0.644
+#: + driver_dnf_10      0.555   +0.0001       0.530
+#: ===================  ======  ============  ===========
+#:
+#: Every feature added made it worse, and the calibration column is the one to
+#: read: a slope of 0.80 against 0.61 is the difference between a probability
+#: you can multiply through an expected-points calculation and one you cannot.
+#: Grid slot is a clean monotone signal and the other hundred columns dilute it.
+#:
+#: An empty tuple means "whatever the registry selects for this stage".
+FEATURE_SETS: dict[str, tuple[str, ...]] = {
+    "full": (),
+    "grid_only": ("grid_position",),
+    "grid_and_team": ("grid_position", "team_dnf_rate_10"),
+    "reliability": ("team_dnf_rate_10", "driver_dnf_rate_10"),
+}
+
+#: The best-measured feature set *for each stage*, which is not the same set.
+#:
+#: ``grid_only`` wins at ``post_quali`` and cannot be used at ``pre_weekend``
+#: at all -- grid position is by definition unknown before qualifying, and it
+#: is the only column carrying real signal.  What is left before Saturday is
+#: close to nothing: walked forward over 2022-2026 the best pre-weekend
+#: combination reaches AUC 0.552 and Brier skill +0.0022, against 0.593 and
+#: +0.0147 once the grid is known.
+#:
+#: That gap is the finding, not a defect to tune away.  A pre-weekend number
+#: here is the base rate with a faint reliability tilt, and should be read as
+#: one.
+DEFAULT_FEATURE_SET_BY_STAGE: dict[str, str] = {
+    "pre_weekend": "reliability",
+    "post_quali": "grid_only",
+    "race_day": "grid_only",
+}
+
+#: What ``--features auto`` resolves to when the stage is unknown.
+DEFAULT_FEATURE_SET = "grid_only"
+
+
+def default_feature_set(stage: str) -> str:
+    """The measured-best feature set for a stage."""
+    return DEFAULT_FEATURE_SET_BY_STAGE.get(stage, DEFAULT_FEATURE_SET)
+
 MODEL_FACTORIES = {
     "baseline": make_baseline,
     "logistic": make_logistic,
@@ -367,6 +424,7 @@ def walk_forward_evaluate(
     min_train_rows: int = 200,
     extra_features: Sequence[str] = (),
     drop_features: Sequence[str] = (),
+    feature_set: str = "full",
 ) -> WalkForwardResult:
     """Train on every prior season, score the next one, and repeat.
 
@@ -390,7 +448,7 @@ def walk_forward_evaluate(
         raise KeyError(f"target {target!r} not in dataset")
 
     selected, numeric, categorical = _select_features(
-        dataset, stage, extra_features, drop_features
+        dataset, stage, extra_features, drop_features, feature_set
     )
 
     seasons = sorted(dataset[season_col].dropna().unique())
@@ -447,14 +505,45 @@ def _select_features(
     stage: registry.Stage,
     extra_features: Sequence[str],
     drop_features: Sequence[str],
+    feature_set: str = "full",
 ) -> tuple[list[str], list[str], list[str]]:
-    """Resolve the registry selection into (all, numeric, categorical)."""
+    """Resolve the registry selection into (all, numeric, categorical).
+
+    ``feature_set`` narrows the registry's stage selection to a named subset
+    before ``extra_features`` and ``drop_features`` are applied.  Narrowing
+    first is what makes ``--features grid_only --drop-features grid_position``
+    an empty selection and therefore an error, rather than silently falling
+    back to everything.
+
+    A feature in the set but not in the dataset is dropped like any other
+    unavailable column, which means a narrowed set can come back empty and
+    raise -- the alternative, quietly widening to the full selection, would fit
+    a different model than the one asked for.
+    """
+    if feature_set not in FEATURE_SETS:
+        raise KeyError(
+            f"unknown feature set {feature_set!r}; "
+            f"choose from {sorted(FEATURE_SETS)}"
+        )
     available = set(dataset.columns)
     selected = registry.feature_columns(stage, available=available)
+    named = FEATURE_SETS[feature_set]
+    if named:
+        keep = set(named)
+        missing = keep - available
+        if missing:
+            log.warning(
+                "feature set %r asks for %s, which this dataset does not carry",
+                feature_set, sorted(missing),
+            )
+        selected = [c for c in selected if c in keep]
     selected = [c for c in [*selected, *extra_features] if c in available]
     selected = [c for c in selected if c not in set(drop_features)]
     if not selected:
-        raise ValueError(f"no registered features for stage {stage!r} in this dataset")
+        raise ValueError(
+            f"no features left for stage {stage!r} with feature set "
+            f"{feature_set!r} in this dataset"
+        )
     numeric = (
         [c for c in selected if registry.BY_NAME[c].kind in ("numeric", "binary")]
         if all(c in registry.BY_NAME for c in selected)
@@ -475,6 +564,7 @@ def walk_forward_races(
     refit_every: int = 1,
     extra_features: Sequence[str] = (),
     drop_features: Sequence[str] = (),
+    feature_set: str = "full",
     start_after: pd.Timestamp | str | None = None,
 ) -> WalkForwardResult:
     """Retrain before every race, the way the model would actually be run.
@@ -508,7 +598,7 @@ def walk_forward_races(
         raise ValueError("refit_every must be at least 1")
 
     selected, numeric, categorical = _select_features(
-        dataset, stage, extra_features, drop_features
+        dataset, stage, extra_features, drop_features, feature_set
     )
 
     frame = dataset.copy()

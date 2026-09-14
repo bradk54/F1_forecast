@@ -212,20 +212,34 @@ def schema_drift(
     """Whether the registry has moved since the saved model was fitted."""
     if manifest is None:
         return False, "no model has been fitted yet"
-    expected = set(registry.feature_columns(stage, available=dataset.columns))
-    saved = set(manifest.features)
     if manifest.stage != stage:
         return False, (
             f"the saved model is a {manifest.stage} model; {stage} needs its "
             f"own fit"
         )
+    # Compare against the saved *feature set*, not the whole registry.  A
+    # grid_only fit has one column by design, and measuring it against all 101
+    # registered ones would report "100 features added" on every page load and
+    # advise a refit that would produce exactly the same model.
+    from src.models.train import _select_features
+
+    try:
+        expected, _, _ = _select_features(
+            dataset, stage, (), (), getattr(manifest, "feature_set", "full")
+        )
+    except (KeyError, ValueError) as exc:
+        return False, f"the saved feature set cannot be resolved: {exc}"
+    expected, saved = set(expected), set(manifest.features)
     added, gone = expected - saved, saved - expected
     if added or gone:
         return False, (
             f"registry drift: {len(added)} feature(s) added since the fit, "
             f"{len(gone)} no longer produced — refit before trusting predictions"
         )
-    return True, f"{len(saved)} features, matching the registry"
+    return True, (
+        f"{len(saved)} feature(s) from the {getattr(manifest, 'feature_set', 'full')!r} "
+        f"set, matching the registry"
+    )
 
 
 # --------------------------------------------------------------------------- #

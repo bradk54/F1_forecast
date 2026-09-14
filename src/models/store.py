@@ -119,6 +119,10 @@ class Manifest:
     features: list[str]
     dataset_rows: int
     dataset_fingerprint: str
+    #: Which named subset of the stage's registry selection was fitted.  Old
+    #: manifests predate it and were all full-selection fits, so "full" is the
+    #: right default rather than a guess.
+    feature_set: str = "full"
     sklearn_version: str = ""
     git_sha: str = field(default_factory=git_sha)
     trained_at: str = field(
@@ -137,7 +141,7 @@ class Manifest:
 
     def describe(self) -> str:
         return (
-            f"{self.model}/{self.stage} trained through "
+            f"{self.model}/{self.stage}[{self.feature_set}] trained through "
             f"{self.trained_through_year} R{self.trained_through_round} "
             f"({self.trained_through_event}) on {self.train_rows} rows, "
             f"base rate {self.train_base_rate:.4f}"

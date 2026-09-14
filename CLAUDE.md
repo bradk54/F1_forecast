@@ -64,7 +64,7 @@ src/features/labels.py        Status + ClassifiedPosition -> dnf and the cause t
 src/features/build_features.py  leakage-safe rolling history (driver/team/pairing/circuit)
 src/features/track_profile.py   circuit geometry from a reference lap's telemetry
 src/features/registry.py      single source of truth for every feature and when it is knowable
-src/models/train.py           walk-forward evaluation, ablation, permutation importance
+src/models/train.py           walk-forward evaluation, feature sets, ablation, importance
 src/models/store.py           saves the fitted model + a manifest that refuses stale/drifted loads
 src/models/monitor.py         the per-race performance log and the drift check
 src/models/predict.py         the CLI: refresh, next, race, status
@@ -73,7 +73,7 @@ src/models/predict.py         the CLI: refresh, next, race, status
 ### Running the model week to week
 
 ```bash
-./.venv/bin/python -m src.models.predict refresh   # Tuesday: score, refit, save
+./.venv/bin/python -m src.models.predict refresh --since 2026   # Tuesday: score, refit, save
 ./.venv/bin/python -m src.models.predict next      # Saturday, after qualifying
 ./.venv/bin/python -m src.models.predict status    # how it has been doing
 ```
@@ -118,6 +118,41 @@ Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Interme
   season; in a settled formula the best window is probably longer.
   The short-window and EWMA *features* are, by contrast, close to neutral —
   keep them, but do not credit them for this.
+- **The model is one feature, and that is the measured answer, not a
+  simplification.** Walked forward race by race over 2022-2026, a logistic
+  regression on `grid_position` alone beats every other combination of model
+  family and feature set in `MODEL_FACTORIES` x `FEATURE_SETS`:
+
+  | model / features | n | AUC | Brier skill | calibration |
+  | --- | --- | --- | --- | --- |
+  | **logistic / grid_only** | **1** | **0.593** | **+0.0147** | **0.915** |
+  | logistic / grid_and_team | 2 | 0.588 | +0.0143 | 0.857 |
+  | random_forest / full | 101 | 0.565 | +0.0057 | 0.606 |
+  | gradient_boosting / full | 101 | 0.533 | −0.0167 | 0.212 |
+  | logistic / full | 101 | 0.539 | −0.3137 | 0.030 |
+
+  Every feature added past the grid makes it worse. Read the calibration column
+  first: 0.92 against 0.61 is the difference between a probability you can
+  multiply through an expected-points calculation and one you cannot.
+  **Family and feature set are not independent** — a random forest on grid alone
+  calibrates at 0.137 because trees turn one ordinal column into a step
+  function, and a logistic on all 101 drowns in correlated columns. Change one
+  and re-run the matrix before changing the other.
+- **Before qualifying, there is essentially no signal, and the code says so.**
+  The best pre-weekend combination reaches AUC 0.552 and Brier skill +0.0022 —
+  the base rate with a faint reliability tilt. `grid_only` is not merely worse
+  pre-weekend, it is *empty*, because grid position is by definition unknown
+  then; `_select_features` raises rather than silently widening to the full
+  selection. `--features auto` resolves per stage (`grid_only` after qualifying,
+  `reliability` before). Treat a pre-weekend number as a prior, not a forecast.
+- **The DNF model's job is calibration, not ranking.** It exists to feed a
+  points model as `expected_points ≈ P(finish) × E[points | finish]`, so a
+  usable probability matters more than a good ordering. Sizing the prize:
+  retirements cost about **10.2%** of the notional points pool, **81%** of those
+  forgone points come from P1-10 starters, and only **37%** of retirements do.
+  The model is therefore weakest exactly where points are decided — AUC among
+  top-10 starters is **0.553**. Do not block points work on improving this; the
+  other 90% of the variance is a finishing-position problem.
 - **Serving artefacts are rebuilt, not stored.** A fit on the default window is
   815 rows and about a quarter of a second, so `Models/dnf_model.joblib` and its
   manifest are gitignored and only the current pair is kept. What *is* committed

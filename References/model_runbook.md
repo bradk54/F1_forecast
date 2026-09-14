@@ -20,16 +20,24 @@ Two commands per race weekend.
 
 | When | Command | What it does |
 | --- | --- | --- |
-| **Tuesday**, after the last race is classified | `predict refresh` | Pulls new results, scores last weekend's prediction into the log, refits, saves |
+| **Tuesday**, after the last race is classified | `predict refresh --since <season>` | Pulls new results, scores last weekend's prediction into the log, refits, saves |
 | **Saturday**, after qualifying | `predict next` | Ranks this weekend's grid by retirement risk |
 
 ```bash
 # Tuesday
-./.venv/bin/python -m src.models.predict refresh
+./.venv/bin/python -m src.models.predict refresh --since 2026
 
 # Saturday, once the grid is set
 ./.venv/bin/python -m src.models.predict next
 ```
+
+**Use `--since`.** Without it the refresh re-downloads every season from 2018,
+which plans roughly 588 session loads against FastF1's limit of 500 an hour — so
+it is not occasionally unlucky, it cannot finish. A pull that dies partway does
+not look like a failure either; it looks like a calendar that lost 85 races.
+`--since 2026` pulls only the live season and splices it into the results
+already on disk: about 38 loads. Run the full range occasionally to pick up
+corrections to older races.
 
 That is the whole cadence. `refresh` scores **before** it refits, which is what
 keeps the log honest — a model scored against data it has just trained on is
@@ -37,7 +45,27 @@ not measuring anything.
 
 If you want a number before qualifying, see
 [Before qualifying vs after](#before-qualifying-vs-after) — it is a different
-model, not the same one with less confidence.
+model, not the same one with less confidence, and on current evidence it is
+barely a model at all.
+
+### What you are actually running
+
+**One feature.** The default is a logistic regression on `grid_position` alone,
+because measured race by race over 2022-2026 it beats every other combination of
+model family and feature set: AUC 0.593 and calibration slope 0.915, against
+0.565 and 0.606 for the 101-feature random forest it replaced. Every feature
+added past the grid made it worse.
+
+`--features` selects the set — `auto` (the default, resolving per stage),
+`grid_only`, `grid_and_team`, `reliability`, `full` — and `--model` still selects
+the family. The two interact: a forest on one ordinal column calibrates at
+0.137, and a logistic on all 101 scores worse than the base rate. Re-run the
+matrix before changing either.
+
+Read the output as a **calibrated probability, not a ranking**. It exists to feed
+`expected_points ≈ P(finish) × E[points | finish]`, and retirements are about 10%
+of the notional points pool — 81% of which is forgone by P1-10 starters, where
+this model is weakest (AUC 0.553).
 
 ---
 
@@ -46,7 +74,8 @@ model, not the same one with less confidence.
 ### `refresh` — the weekly retrain
 
 ```bash
-./.venv/bin/python -m src.models.predict refresh
+./.venv/bin/python -m src.models.predict refresh --since 2026    # the weekly path
+./.venv/bin/python -m src.models.predict refresh                 # full range, occasionally
 ./.venv/bin/python -m src.models.predict refresh --offline      # warm cache, no network
 ./.venv/bin/python -m src.models.predict refresh --no-download   # dataset as-is
 ./.venv/bin/python -m src.models.predict refresh --lookback 60   # wider training window
