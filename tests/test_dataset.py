@@ -14,6 +14,7 @@ from src.data.generate_dataset import (
     join_circuit_profiles,
     lost_races,
     main,
+    merge_results,
     parse_seasons,
     prepare_circuit_profiles,
     race_calendar,
@@ -467,3 +468,131 @@ def test_allow_shrink_lets_it_through(
     assert len(race_calendar(pd.read_parquet(config.RACE_RESULTS_PATH))) == len(
         race_calendar(degraded)
     )
+
+
+# --------------------------------------------------------------------------- #
+# Incremental pulls
+# --------------------------------------------------------------------------- #
+#
+# A settled season cannot change, and re-downloading 173 of 186 events to add
+# this Sunday's race is what exhausts a 500-call hour before the new race is
+# reached.  --since pulls only the recent seasons and splices them into what is
+# already on disk.  What matters is that the splice cannot hide a failed pull.
+
+
+def _results(years_rounds, *, status="Finished") -> pd.DataFrame:
+    rows = []
+    for year, rnd in years_rounds:
+        for driver in ("alpha", "beta"):
+            rows.append({
+                "Year": year, "RoundNumber": rnd,
+                "EventName": f"Round {rnd} Grand Prix",
+                "DriverId": driver, "Status": status,
+            })
+    return pd.DataFrame(rows)
+
+
+class TestMergeResults:
+    def test_untouched_seasons_are_carried_through(self) -> None:
+        previous = _results([(2024, 1), (2025, 1)])
+        fresh = _results([(2026, 1)])
+        merged = merge_results(previous, fresh, pulled=[2026])
+        assert sorted(merged["Year"].unique()) == [2024, 2025, 2026]
+
+    def test_a_pulled_season_is_replaced_not_appended(self) -> None:
+        """A corrected result must be able to overwrite the row it corrects."""
+        previous = _results([(2026, 1)], status="Finished")
+        fresh = _results([(2026, 1)], status="Disqualified")
+        merged = merge_results(previous, fresh, pulled=[2026])
+        assert len(merged) == 2, "the old 2026 rows were appended, not replaced"
+        assert set(merged["Status"]) == {"Disqualified"}
+
+    def test_a_pulled_season_losing_a_round_still_loses_it(self) -> None:
+        """Replacement is wholesale, so the coverage check can still see a loss."""
+        previous = _results([(2026, 1), (2026, 2)])
+        fresh = _results([(2026, 1)])
+        merged = merge_results(previous, fresh, pulled=[2026])
+        assert set(merged.loc[merged["Year"] == 2026, "RoundNumber"]) == {1}
+
+    def test_no_previous_file_gives_back_the_pull(self) -> None:
+        fresh = _results([(2026, 1)])
+        assert merge_results(None, fresh, pulled=[2026]).equals(fresh)
+        assert merge_results(pd.DataFrame(), fresh, pulled=[2026]).equals(fresh)
+
+    def test_an_empty_pull_does_not_erase_what_is_stored(self) -> None:
+        previous = _results([(2024, 1)])
+        merged = merge_results(previous, pd.DataFrame(), pulled=[2026])
+        assert merged.equals(previous)
+
+
+class TestSinceOnTheCli:
+    def test_only_the_requested_seasons_are_pulled(
+        self, cli, raw_results, capsys, monkeypatch
+    ) -> None:
+        cli(raw_results, capsys)  # seed the full calendar on disk
+
+        asked: list[list[int]] = []
+
+        def spy(seasons, **kwargs):
+            asked.append(list(seasons))
+            return raw_results.loc[raw_results["Year"] == 2023], pd.DataFrame()
+
+        monkeypatch.setattr("src.data.generate_dataset.collect_raw", spy)
+        code = main(["--seasons", "2021-2023", "--since", "2023"])
+
+        assert code == 0, capsys.readouterr().out
+        assert asked == [[2023]], "seasons before --since were pulled anyway"
+
+    def test_the_older_seasons_survive_the_partial_pull(
+        self, cli, raw_results, capsys, monkeypatch
+    ) -> None:
+        """The whole point: a 2023-only pull must not read as losing 2021-2022."""
+        cli(raw_results, capsys)
+        monkeypatch.setattr(
+            "src.data.generate_dataset.collect_raw",
+            lambda seasons, **kwargs: (
+                raw_results.loc[raw_results["Year"] == 2023], pd.DataFrame()
+            ),
+        )
+        code = main(["--seasons", "2021-2023", "--since", "2023"])
+        out = capsys.readouterr().out
+
+        assert code == 0, out
+        assert "coverage check: FAILED" not in out
+        on_disk = pd.read_parquet(config.RACE_RESULTS_PATH)
+        assert len(race_calendar(on_disk)) == len(race_calendar(raw_results))
+
+    def test_a_totally_failed_pull_is_not_papered_over(
+        self, cli, raw_results, capsys, monkeypatch
+    ) -> None:
+        """Without the pre-merge emptiness check this would report success."""
+        cli(raw_results, capsys)
+        monkeypatch.setattr(
+            "src.data.generate_dataset.collect_raw",
+            lambda seasons, **kwargs: (pd.DataFrame(), pd.DataFrame()),
+        )
+        code = main(["--seasons", "2021-2023", "--since", "2023"])
+        assert code == 1, capsys.readouterr().out
+
+    def test_a_shrunken_pull_of_the_live_season_still_fails_the_check(
+        self, cli, raw_results, capsys, monkeypatch
+    ) -> None:
+        """--since narrows what is pulled, it does not switch the guard off."""
+        cli(raw_results, capsys)
+        degraded = drop_races(
+            raw_results.loc[raw_results["Year"] == 2023], [(2023, 2)]
+        )
+        monkeypatch.setattr(
+            "src.data.generate_dataset.collect_raw",
+            lambda seasons, **kwargs: (degraded, pd.DataFrame()),
+        )
+        code = main(["--seasons", "2021-2023", "--since", "2023"])
+        out = capsys.readouterr().out
+        assert code == 5, out
+        assert "coverage check: FAILED" in out
+
+    def test_since_that_excludes_every_season_is_refused(
+        self, cli, raw_results, capsys
+    ) -> None:
+        cli(raw_results, capsys)
+        assert main(["--seasons", "2021-2023", "--since", "2030"]) == 1

@@ -90,8 +90,23 @@ def parse_seasons(text: str) -> tuple[int, ...]:
 # --------------------------------------------------------------------------- #
 
 
+def _stored(path: Path) -> pd.DataFrame | None:
+    """Read a cached parquet if it is there, else None."""
+    if not path.exists():
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception as exc:  # noqa: BLE001 - a corrupt cache must not stop a pull
+        log.warning("could not read %s (%s); rebuilding it", path, exc)
+        return None
+
+
 def collect_raw(
-    seasons: Sequence[int], *, include_sprints: bool = True, offline: bool = False
+    seasons: Sequence[int],
+    *,
+    include_sprints: bool = True,
+    offline: bool = False,
+    reuse_profiles: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Download results and circuit profiles.
 
@@ -103,6 +118,9 @@ def collect_raw(
             rebuild works fully offline -- and avoids re-requesting entries
             that have merely expired, which is what provokes an HTTP 429 from
             the Ergast backend and silently drops ``Status`` from a session.
+        reuse_profiles: Carry stored ``(circuit_key, year)`` profiles through
+            instead of re-deriving them.  Set False when the profile code has
+            changed and the stored rows are the stale thing.
 
     Returns:
         ``(results, profiles)``.
@@ -123,9 +141,92 @@ def collect_raw(
     )
     log.info("results: %s", results_report.summary())
 
-    profiles, profile_report = ingest.collect_circuit_profiles(seasons)
+    profiles, profile_report = ingest.collect_circuit_profiles(
+        seasons,
+        existing=_stored(config.CIRCUIT_PROFILE_PATH) if reuse_profiles else None,
+        # The circuit each round ran at, which is what makes reuse decidable
+        # without opening a session.  Prefer the rows just pulled and fall back
+        # to what is on disk, so a --since run can still place older rounds.
+        results=(
+            pd.concat([r for r in (_stored(config.RACE_RESULTS_PATH), results)
+                       if r is not None and not r.empty], ignore_index=True)
+            if not results.empty else _stored(config.RACE_RESULTS_PATH)
+        ),
+    )
     log.info("circuit profiles: %s", profile_report.summary())
     return results, profiles
+
+
+def merge_results(
+    previous: pd.DataFrame | None, fresh: pd.DataFrame, *, pulled: Sequence[int]
+) -> pd.DataFrame:
+    """Splice a partial pull into the results already on disk.
+
+    ``--since`` exists because a settled season cannot change: 2018-2025 is 173
+    of the 186 events, and re-downloading them to add this Sunday's race is what
+    exhausts the rate limit before the new race is ever reached.  So only the
+    seasons in ``pulled`` come from the network, and every earlier season is
+    carried through from ``previous`` unchanged.
+
+    The seasons in ``pulled`` are replaced wholesale rather than row-merged.  A
+    result that was later corrected -- a post-race penalty, a reinstated
+    classification -- must be able to overwrite the row it corrects, and a merge
+    that only ever added rows could not do that.
+    """
+    if previous is None or previous.empty:
+        return fresh
+    if fresh.empty:
+        return previous
+    if "Year" not in previous.columns:
+        return fresh
+    kept = previous.loc[~previous["Year"].isin(list(pulled))]
+    if kept.empty:
+        return fresh
+    return pd.concat([kept, fresh], ignore_index=True)
+
+
+def merge_profiles(
+    previous: pd.DataFrame | None, fresh: pd.DataFrame, *, pulled: Sequence[int]
+) -> pd.DataFrame:
+    """Splice freshly derived circuit profiles into the ones already on disk.
+
+    Needed for the same reason as :func:`merge_results` and easy to forget for
+    a worse reason: ``collect_circuit_profiles`` only walks the seasons it is
+    asked for, so a ``--since 2026`` run returns 2026's profiles *and nothing
+    else*.  Writing that straight out replaces a file describing every circuit
+    since 2018 with one describing this season -- and unlike a lost race,
+    nothing downstream raises.  The dataset simply builds with the circuit
+    median standing in for two thirds of its track geometry.
+    """
+    if previous is None or previous.empty:
+        return fresh
+    if fresh.empty:
+        return previous
+    if "year" not in previous.columns:
+        return fresh
+    kept = previous.loc[~previous["year"].isin(list(pulled))]
+    if kept.empty:
+        return fresh
+    return pd.concat([kept, fresh], ignore_index=True)
+
+
+def lost_profiles(fresh: pd.DataFrame, previous: pd.DataFrame) -> pd.DataFrame:
+    """``(circuit_key, year)`` pairs that were profiled before and are not now.
+
+    The results file has had a coverage check since a rate-limited pull nearly
+    erased half the calendar.  Profiles never had one, and they fail more
+    quietly: a missing profile is not an error anywhere downstream, it is just
+    ``has_track_profile = 0`` and a median where a measurement used to be.
+    """
+    key = ["circuit_key", "year"]
+    if previous is None or previous.empty or not set(key).issubset(previous.columns):
+        return pd.DataFrame(columns=key)
+    if fresh.empty or not set(key).issubset(fresh.columns):
+        return previous[key].drop_duplicates()
+    before = previous[key].dropna().drop_duplicates()
+    now = set(map(tuple, fresh[key].dropna().drop_duplicates().to_numpy()))
+    missing = [row for row in map(tuple, before.to_numpy()) if row not in now]
+    return pd.DataFrame(missing, columns=key)
 
 
 def _write(frame: pd.DataFrame, path: Path, label: str) -> None:
@@ -459,6 +560,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--out", type=Path, default=config.DNF_DATASET_PATH, help="Output parquet path."
     )
     parser.add_argument(
+        "--since",
+        type=int,
+        default=None,
+        metavar="YEAR",
+        help="Only pull seasons from YEAR onward and reuse the stored results "
+             "for everything earlier. A settled season cannot change, so this "
+             "is the cheap way to add the latest race: it is the difference "
+             "between ~186 and ~13 session loads against a 500/hour limit. "
+             "Run the full range occasionally to pick up corrections to older "
+             "races.",
+    )
+    parser.add_argument(
+        "--rebuild-profiles",
+        action="store_true",
+        help="Re-derive every circuit profile instead of reusing the stored "
+             "ones. Needed only when the profile code itself has changed.",
+    )
+    parser.add_argument(
         "--allow-shrink",
         action="store_true",
         help="Write the results even if the rebuild covers fewer races than "
@@ -475,6 +594,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     seasons = parse_seasons(args.seasons)
     log.info("seasons: %s", ", ".join(map(str, seasons)))
 
+    if args.offline and args.rebuild_profiles:
+        # Warned about rather than refused, because whether this works is a
+        # property of the cache and not of the flags.  Re-deriving a profile
+        # needs timing and telemetry, which a cache populated only by result
+        # pulls (laps=False, telemetry=False) never acquired -- but a cache the
+        # notebooks have driven does hold it.  The profile check below is what
+        # actually catches the bad case, and it catches it by counting rows
+        # rather than by guessing from arguments.
+        log.warning(
+            "--offline --rebuild-profiles re-derives profiles from the cache, "
+            "which only works if that cache holds telemetry. A cache populated "
+            "by result pulls alone does not. Point F1_FASTF1_CACHE at one that "
+            "does, or drop --offline."
+        )
+
     if args.skip_download:
         for path, label in (
             (config.RACE_RESULTS_PATH, "results"),
@@ -487,15 +621,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         profiles = pd.read_parquet(config.CIRCUIT_PROFILE_PATH)
         log.info("reusing %d result rows and %d profiles", len(results), len(profiles))
     else:
+        pull = seasons
+        if args.since is not None:
+            pull = [y for y in seasons if y >= args.since]
+            if not pull:
+                log.error(
+                    "--since %s excludes every requested season (%s); nothing "
+                    "to pull", args.since, args.seasons,
+                )
+                return 1
+            skipped = [y for y in seasons if y not in pull]
+            log.info(
+                "incremental: pulling %s from the network, reusing stored "
+                "results for %s",
+                ", ".join(map(str, pull)),
+                ", ".join(map(str, skipped)) or "nothing",
+            )
+            if skipped and not config.RACE_RESULTS_PATH.exists():
+                log.error(
+                    "--since needs stored results for the seasons it skips, "
+                    "but %s is missing. Run the full range once first.",
+                    config.RACE_RESULTS_PATH,
+                )
+                return 2
         try:
             results, profiles = collect_raw(
-                seasons,
+                pull,
                 include_sprints=not args.no_sprints,
                 offline=args.offline,
+                reuse_profiles=not args.rebuild_profiles,
             )
         except RuntimeError as exc:
             log.error("%s", exc)
             return 1
+        # Emptiness is judged on the *pull*, before anything is spliced in.
+        # Under --since a total failure would otherwise be papered over by the
+        # stored seasons: the merge would hand back the previous file, the
+        # coverage check would find nothing missing, and a run that fetched
+        # nothing at all would report success.
         if results.empty:
             # Every season failed.  Almost always the network or an Ergast rate
             # limit rather than anything about the data, so say what to do next
@@ -510,6 +673,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "  Check F1_FASTF1_CACHE points at the cache you actually have."
             )
             return 1
+        if args.since is not None:
+            # Splice after the emptiness check and before the coverage check,
+            # so the coverage check still sees the whole calendar and a partial
+            # pull cannot read as a lost one.
+            results = merge_results(
+                _stored(config.RACE_RESULTS_PATH), results, pulled=pull
+            )
+            profiles = merge_profiles(
+                _stored(config.CIRCUIT_PROFILE_PATH), profiles, pulled=pull
+            )
         # Compare against what is on disk *before* overwriting it: once the
         # parquet is replaced there is nothing left to compare against, and a
         # pull that quietly lost half the calendar looks identical to a good one.
@@ -529,6 +702,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "--allow-shrink if the loss is intended."
                 )
                 return 5
+
+        # The same check the results get, for the same reason -- except a lost
+        # profile is quieter, so it would otherwise only surface as track
+        # features mysteriously going median.
+        if config.CIRCUIT_PROFILE_PATH.exists() and not args.allow_shrink:
+            gone = lost_profiles(profiles, pd.read_parquet(config.CIRCUIT_PROFILE_PATH))
+            if not gone.empty:
+                print(f"\n=== profile check: FAILED "
+                      f"({len(gone)} circuit-season(s) profiled before and not now) ===")
+                print(gone.head(20).to_string(index=False))
+                print(
+                    "\nNothing was overwritten. A profile describes a layout in "
+                    "a season and cannot expire, so losing one means the pull "
+                    "did not reach it.\nRe-derive them with --rebuild-profiles, "
+                    "or pass --allow-shrink if the loss is intended."
+                )
+                return 6
 
         _write(results, config.RACE_RESULTS_PATH, "results")
         if not profiles.empty:

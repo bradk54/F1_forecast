@@ -404,6 +404,35 @@ def extract_weather(session) -> dict[str, Any]:
     return out
 
 
+#: Schedule ``EventFormat`` values that include a sprint race.  FastF1 has used
+#: several names for it across seasons ("sprint", "sprint_shootout",
+#: "sprint_qualifying"), so the test is a substring rather than a set.
+SPRINT_FORMAT_TOKEN = "sprint"
+
+
+def event_has_sprint(event) -> bool:
+    """Whether this weekend runs a sprint, according to the schedule.
+
+    Asking the schedule first is worth a function because the alternative costs
+    real money against the Ergast rate limit: only 29 of the 186 events from
+    2018 onward have ever had a sprint, and 2018-2020 had none at all, so
+    attempting one per weekend spends roughly 157 requests an hour to learn
+    something the calendar already knew.
+
+    An absent or unreadable ``EventFormat`` returns True.  A schedule that does
+    not carry the column is the older shape, and guessing "no sprint" there
+    would silently drop real rows -- a wasted request is cheaper than a missing
+    one.
+    """
+    try:
+        fmt = event.get("EventFormat")
+    except Exception:  # noqa: BLE001 - a Series-like without .get
+        return True
+    if fmt is None or (isinstance(fmt, float) and pd.isna(fmt)):
+        return True
+    return SPRINT_FORMAT_TOKEN in str(fmt).lower()
+
+
 def collect_season_results(
     year: int,
     *,
@@ -434,7 +463,9 @@ def collect_season_results(
 
     for _, event in schedule.iterrows():
         label = f"{year} {event['EventName']}"
-        wanted = ["R"] + (["S"] if include_sprints else [])
+        wanted = ["R"]
+        if include_sprints and event_has_sprint(event):
+            wanted.append("S")
         for session_type in wanted:
             try:
                 session = load_session(
@@ -562,21 +593,76 @@ def profile_event(
     return build_lap_profile(telemetry, step_m=step_m, corners=corners, metadata=meta)
 
 
+def circuit_keys_by_round(results: pd.DataFrame | None) -> dict[tuple[int, int], float]:
+    """``(year, round) -> circuit_key``, read from results already on disk.
+
+    Exists to break a chicken-and-egg problem.  A profile is keyed on
+    ``(circuit_key, year)``, but the circuit key lives in the session -- so
+    deciding whether a profile is already stored would itself require loading
+    the session it is meant to avoid loading.  Past results carry the same
+    mapping and cost nothing to read.
+    """
+    if results is None or results.empty:
+        return {}
+    needed = {"Year", "RoundNumber", "circuit_key"}
+    if not needed.issubset(results.columns):
+        return {}
+    frame = results[list(needed)].dropna().drop_duplicates(
+        subset=["Year", "RoundNumber"]
+    )
+    return {
+        (int(r.Year), int(r.RoundNumber)): float(r.circuit_key)
+        for r in frame.itertuples(index=False)
+    }
+
+
 def collect_circuit_profiles(
     seasons: Sequence[int] = config.DEFAULT_SEASONS,
     *,
     step_m: float = config.TRACK_RESAMPLE_STEP_M,
+    existing: pd.DataFrame | None = None,
+    results: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, IngestReport]:
-    """Profile every circuit in every requested season.
+    """Profile every circuit in every requested season, reusing what is stored.
 
     This is the expensive part of the pipeline: it downloads telemetry for one
     session per event.  Expect roughly a minute per event on a cold cache and
     seconds on a warm one.
+
+    Args:
+        existing: Profiles already on disk.  A ``(circuit_key, year)`` present
+            here is carried through untouched instead of being re-derived.
+        results: Race results already on disk, used only to learn which circuit
+            each round ran at without opening a session.
+
+    A profile describes a layout in a season, and a layout in a past season
+    cannot change -- so re-deriving 178 of them to add one new circuit is the
+    single largest source of traffic in a rebuild, and the one most likely to
+    exhaust the rate limit before the new race is ever reached.  Reuse is
+    therefore the default; pass ``existing=None`` to force a full rebuild when
+    the profile *code* has changed and the stored rows are the stale thing.
+
+    Returns:
+        ``(profiles, report)`` where ``profiles`` carries the reused rows and
+        the newly derived ones together, so the caller can write a complete file.
     """
     import fastf1
 
     report = IngestReport()
-    rows = []
+    # Stored rows are kept as plain dicts so that reused and freshly derived
+    # rows are the same shape; ``pd.DataFrame`` cannot build a frame from a
+    # list that mixes Series and dicts.
+    stored: dict[tuple[float, int], dict] = {}
+    if existing is not None and not existing.empty:
+        if {"circuit_key", "year"}.issubset(existing.columns):
+            for _, row in existing.iterrows():
+                if pd.notna(row["circuit_key"]):
+                    stored[(float(row["circuit_key"]), int(row["year"]))] = row.to_dict()
+
+    by_round = circuit_keys_by_round(results)
+    rows: list[dict] = []
+    reused = 0
+
     for year in seasons:
         try:
             schedule = fastf1.get_event_schedule(year, include_testing=False)
@@ -585,10 +671,22 @@ def collect_circuit_profiles(
             continue
         for _, event in schedule.iterrows():
             label = f"{year} {event['EventName']}"
+            round_number = event["RoundNumber"]
+
+            key = by_round.get((int(year), int(round_number)))
+            if key is not None and (key, int(year)) in stored:
+                rows.append(stored[(key, int(year))])
+                reused += 1
+                continue
+
             try:
-                rows.append(profile_event(year, event["RoundNumber"], step_m=step_m))
+                rows.append(profile_event(year, round_number, step_m=step_m))
                 report.add_success(label)
                 log.info("profiled %s", label)
             except Exception as exc:  # noqa: BLE001
                 report.add_failure(label, exc)
+
+    if reused:
+        log.info("reused %d stored circuit profile(s); derived %d",
+                 reused, len(report.loaded))
     return (pd.DataFrame(rows) if rows else pd.DataFrame()), report

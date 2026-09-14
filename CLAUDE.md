@@ -139,8 +139,49 @@ Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Interme
   that lost a third of its calendar — observed taking 2025 from 24 races to 10.
   `lost_races` compares against the results on disk *before* overwriting them
   and returns exit 5 rather than writing.
+- **Every network pull is spending a budget. Assume the limit is the binding
+  constraint, not the wall clock.** FastF1's own limiter allows **500 calls an
+  hour across any API**, and it counts result loads and telemetry loads alike.
+  A naive full rebuild plans ~588 session loads, so it is *structurally
+  guaranteed* to run out partway — and a pull that dies partway does not look
+  like a failure, it looks like a calendar that lost 85 races. Before writing
+  anything that fetches, work out how many loads it plans and cut the ones that
+  cannot tell you anything new:
+  - **Reuse what is stored rather than re-deriving it.** A settled season
+    cannot change. `--since 2026` pulls only the live season and splices it into
+    the results on disk (186 → 13 result loads). `collect_circuit_profiles`
+    carries stored `(circuit_key, year)` rows through untouched (196 → ~10
+    telemetry loads); `--rebuild-profiles` forces the full re-derivation, and is
+    only for when the profile *code* changed.
+  - **Ask the calendar before asking the network.** Only 29 of 186 events have
+    ever run a sprint; `event_has_sprint` reads the schedule's `EventFormat`
+    instead of spending a request to find out.
+  - Together: ~588 → ~39 loads for a weekly refresh. Run the full range
+    occasionally to pick up corrections to old races, not every week.
+- **There are two FastF1 caches, and only one of them holds telemetry.**
+  `src/config.py` points at `Data/raw/fastf1_cache`, which the result pulls
+  populate with `laps=False, telemetry=False` — so it has ~217 `session_info`
+  files and essentially **no** `car_data`. The notebook track's cache is
+  `Data/raw` itself and holds ~326 telemetry files. Re-deriving circuit
+  profiles offline therefore fails against the default cache and succeeds
+  against the other one:
+
+  ```bash
+  F1_FASTF1_CACHE=Data/raw python -m src.data.generate_dataset --offline --rebuild-profiles
+  ```
+
+  This is the cheapest way to repair profiles — it costs no requests at all.
+  Check the profile count rather than the exit code; exit 6 fires if rows were
+  lost.
+- **Never reach for `--allow-shrink` to get past a guard.** The guards exist
+  because a rate-limited pull is indistinguishable from a good one by every
+  other check. `--allow-shrink` is for a loss you intended and can name; using
+  it to silence a check that is telling you the pull was incomplete converts a
+  refused write into a real data loss. If a guard fires, the answer is to wait
+  for the limit to clear and pull again.
 - **Exit codes:** 1 no data / unreachable, 2 missing cached intermediates,
-  3 leakage, 4 a race with no finishing status, 5 a rebuild that lost races.
+  3 leakage, 4 a race with no finishing status, 5 a rebuild that lost races,
+  6 a rebuild that lost circuit profiles.
 
 ## Conventions
 
