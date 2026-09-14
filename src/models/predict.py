@@ -41,8 +41,10 @@ from src.features import registry
 from src.features.build_features import ORDER_COL, build_history_features
 from src.features.labels import FINISHED
 from src.models import monitor, store
+from src.models import train as train_defaults
 from src.models.train import (
     DEFAULT_LOOKBACK_RACES,
+    FEATURE_SETS,
     MODEL_FACTORIES,
     TARGET,
     _select_features,
@@ -50,8 +52,23 @@ from src.models.train import (
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "random_forest"
+#: Measured, not assumed.  Walked forward race by race over 2022-2026, a
+#: one-feature logistic on grid position beats every other combination of model
+#: family and feature set in this module -- AUC 0.593 against the previous
+#: default's 0.565, Brier skill +0.0147 against +0.0057, and calibration slope
+#: 0.915 against 0.606.  See :data:`src.models.train.FEATURE_SETS`.
+#:
+#: The family and the feature set are not independent choices.  A random forest
+#: on grid alone calibrates terribly (0.137) because trees turn one ordinal
+#: column into a step function, and a logistic on all 101 is worse than the base
+#: rate (-0.31) because it drowns in correlated columns.  Change one and re-run
+#: the matrix before changing the other.
+DEFAULT_MODEL = "logistic"
 DEFAULT_STAGE: registry.Stage = "post_quali"
+#: ``auto`` resolves per stage at parse time, because the best set is not the
+#: same before and after qualifying and argparse cannot express that in a
+#: default.
+AUTO_FEATURE_SET = "auto"
 
 
 # --------------------------------------------------------------------------- #
@@ -80,13 +97,18 @@ def fit_current(
     model: str = DEFAULT_MODEL,
     stage: registry.Stage = DEFAULT_STAGE,
     lookback_races: int | None = DEFAULT_LOOKBACK_RACES,
+    feature_set: str | None = None,
     target: str = TARGET,
 ) -> tuple[object, store.Manifest, list[str]]:
     """Fit on the most recent races and build the manifest that describes it."""
+    if feature_set is None:
+        feature_set = train_defaults.default_feature_set(stage)
     train = training_window(dataset, lookback_races)
     if train.empty:
         raise ValueError("no training rows in the selected window")
-    selected, numeric, categorical = _select_features(train, stage, (), ())
+    selected, numeric, categorical = _select_features(
+        train, stage, (), (), feature_set
+    )
     estimator = MODEL_FACTORIES[model](numeric, categorical)
     estimator.fit(train[selected], train[target])
 
@@ -94,6 +116,7 @@ def fit_current(
     manifest = store.Manifest(
         model=model,
         stage=stage,
+        feature_set=feature_set,
         lookback_races=lookback_races,
         train_rows=len(train),
         train_base_rate=float(train[target].mean()),
@@ -336,6 +359,12 @@ def cmd_refresh(args) -> int:
 
         seasons = f"{config.FIRST_TELEMETRY_SEASON}-{config.LATEST_SEASON - 1}"
         argv = ["--seasons", seasons]
+        # The weekly command is the one that has to stay inside the rate limit,
+        # so it is also the one that most needs the incremental path: a full
+        # pull plans ~588 session loads against a 500/hour ceiling, and only
+        # the live season can have changed since last Tuesday.
+        if args.since is not None:
+            argv += ["--since", str(args.since)]
         if args.offline:
             argv.append("--offline")
         code = generate_dataset.main(argv)
@@ -396,7 +425,7 @@ def cmd_refresh(args) -> int:
 
     estimator, manifest, _ = fit_current(
         dataset, model=args.model, stage=args.stage,
-        lookback_races=args.lookback,
+        lookback_races=args.lookback, feature_set=args.features,
     )
     model_path, manifest_path = store.save_model(estimator, manifest)
     print(f"\nfitted: {manifest.describe()}")
@@ -410,7 +439,12 @@ def cmd_refresh(args) -> int:
 
 def _predict_event(args, event: dict) -> int:
     dataset = load_dataset()
-    expected = registry.feature_columns(args.stage, available=dataset.columns)
+    # Derive the expectation from the *saved* feature set, not from the full
+    # registry selection.  Comparing a grid_only fit against all 101 registered
+    # columns would report schema drift on every load and tell you to refit,
+    # which would produce exactly the same model again.
+    saved_set = store.read_manifest().feature_set
+    expected, _, _ = _select_features(dataset, args.stage, (), (), saved_set)
     estimator, manifest = store.load_model(
         dataset, expected_features=expected, expected_stage=args.stage
     )
@@ -572,11 +606,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                         choices=["pre_weekend", "post_quali"],
                         help="Information available to the model.")
     common.add_argument("--model", default=DEFAULT_MODEL, choices=sorted(MODEL_FACTORIES))
+    common.add_argument(
+        "--features", default=AUTO_FEATURE_SET,
+        choices=[AUTO_FEATURE_SET, *sorted(FEATURE_SETS)],
+        help="Which subset of the stage's registered features to fit on. "
+             "'auto' (the default) picks the measured-best set for the stage: "
+             "grid_only after qualifying, reliability before it. 'full' is the "
+             "whole registry selection.",
+    )
 
     p_refresh = sub.add_parser("refresh", parents=[common],
                                help="Score the outstanding prediction, then refit.")
     p_refresh.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK_RACES,
                            help="Races of history to train on. 0 means all.")
+    p_refresh.add_argument("--since", type=int, default=None, metavar="YEAR",
+                           help="Only pull seasons from YEAR onward, reusing "
+                                "the stored results for earlier ones. The cheap "
+                                "weekly path: ~38 session loads against ~588 "
+                                "for a full pull, on a 500/hour limit.")
     p_refresh.add_argument("--no-download", action="store_true",
                            help="Skip the data pull and use the dataset as it is.")
     p_refresh.add_argument("--offline", action="store_true",
@@ -606,6 +653,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_status.set_defaults(func=cmd_status)
 
     args = parser.parse_args(argv)
+    if getattr(args, "features", None) == AUTO_FEATURE_SET:
+        args.features = train_defaults.default_feature_set(args.stage)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
         format="%(levelname)-8s %(name)s: %(message)s",

@@ -13,7 +13,8 @@ import pandas as pd
 import pytest
 
 from src.features import registry
-from src.models import monitor, store
+from src.models import monitor, predict, store
+from src.models import train
 from src.models.predict import (
     build_inference_rows,
     circuit_for_event,
@@ -540,3 +541,170 @@ def test_reading_an_absent_prediction_log(tmp_path) -> None:
     frame = monitor.read_predictions(tmp_path / "nothing.csv")
     assert frame.empty
     assert list(frame.columns) == list(monitor.PREDICTION_COLUMNS)
+
+
+# --------------------------------------------------------------------------- #
+# Feature sets
+# --------------------------------------------------------------------------- #
+#
+# The registry says *when* a feature becomes knowable.  A feature set says which
+# of the knowable ones a model may use.  They were one axis until measurement
+# forced them apart: a one-feature logistic on grid position beats the full
+# 101-column selection on AUC, Brier skill and calibration alike.
+
+
+class TestFeatureSetSelection:
+    def test_a_named_set_narrows_the_registry_selection(self, modelling_dataset) -> None:
+        full, _, _ = train._select_features(
+            modelling_dataset, "post_quali", (), (), "full"
+        )
+        grid, _, _ = train._select_features(
+            modelling_dataset, "post_quali", (), (), "grid_only"
+        )
+        assert grid == ["grid_position"]
+        assert len(full) > len(grid)
+
+    def test_an_unknown_set_is_refused_rather_than_ignored(
+        self, modelling_dataset
+    ) -> None:
+        with pytest.raises(KeyError, match="unknown feature set"):
+            train._select_features(
+                modelling_dataset, "post_quali", (), (), "nonsense"
+            )
+
+    def test_narrowing_happens_before_dropping(self, modelling_dataset) -> None:
+        """So --features grid_only --drop grid_position is empty, not full."""
+        with pytest.raises(ValueError, match="no features left"):
+            train._select_features(
+                modelling_dataset, "post_quali", (), ("grid_position",), "grid_only"
+            )
+
+    def test_grid_only_is_empty_before_qualifying(self, modelling_dataset) -> None:
+        """Not a bug: grid position is by definition unknown pre-weekend."""
+        with pytest.raises(ValueError, match="no features left"):
+            train._select_features(
+                modelling_dataset, "pre_weekend", (), (), "grid_only"
+            )
+
+    def test_extra_features_still_apply_on_top_of_a_narrowed_set(
+        self, modelling_dataset
+    ) -> None:
+        selected, _, _ = train._select_features(
+            modelling_dataset, "post_quali", ("team_dnf_rate_10",), (), "grid_only"
+        )
+        assert set(selected) == {"grid_position", "team_dnf_rate_10"}
+
+
+class TestStageAwareDefaults:
+    def test_each_stage_gets_the_set_that_measured_best_for_it(self) -> None:
+        assert train.default_feature_set("post_quali") == "grid_only"
+        assert train.default_feature_set("pre_weekend") == "reliability"
+
+    def test_an_unknown_stage_falls_back_rather_than_raising(self) -> None:
+        assert train.default_feature_set("nonsense") == train.DEFAULT_FEATURE_SET
+
+    @pytest.mark.parametrize("stage", ["pre_weekend", "post_quali"])
+    def test_the_default_set_is_never_empty_for_its_own_stage(
+        self, modelling_dataset, stage
+    ) -> None:
+        """The pairing has to be usable, or `refresh --stage X` cannot run."""
+        selected, _, _ = train._select_features(
+            modelling_dataset, stage, (), (), train.default_feature_set(stage)
+        )
+        assert selected
+
+
+class TestManifestCarriesTheFeatureSet:
+    def test_a_fit_records_which_set_it_used(self, modelling_dataset) -> None:
+        _, manifest, selected = predict.fit_current(
+            modelling_dataset, model="logistic", stage="post_quali",
+            feature_set="grid_only", lookback_races=None,
+        )
+        assert manifest.feature_set == "grid_only"
+        assert selected == ["grid_position"]
+        assert manifest.features == ["grid_position"]
+
+    def test_the_stage_default_is_used_when_none_is_given(
+        self, modelling_dataset
+    ) -> None:
+        _, manifest, _ = predict.fit_current(
+            modelling_dataset, model="logistic", stage="post_quali",
+            lookback_races=None,
+        )
+        assert manifest.feature_set == "grid_only"
+
+    def test_a_manifest_written_before_feature_sets_reads_as_full(self) -> None:
+        """Every pre-existing fit used the whole registry selection."""
+        older = {
+            "model": "random_forest", "stage": "post_quali", "lookback_races": 40,
+            "train_rows": 815, "train_base_rate": 0.1436,
+            "trained_through_year": 2026, "trained_through_round": 14,
+            "trained_through_event": "Spanish Grand Prix",
+            "features": ["grid_position"], "dataset_rows": 3740,
+            "dataset_fingerprint": "abc",
+        }
+        assert store.Manifest.from_dict(older).feature_set == "full"
+
+    def test_describe_names_the_set(self, modelling_dataset) -> None:
+        _, manifest, _ = predict.fit_current(
+            modelling_dataset, model="logistic", stage="post_quali",
+            feature_set="grid_only", lookback_races=None,
+        )
+        assert "[grid_only]" in manifest.describe()
+
+
+class TestFeatureSetsAreWellFormed:
+    def test_every_named_column_is_registered(self) -> None:
+        """A set naming an unregistered column would silently select nothing."""
+        for name, columns in train.FEATURE_SETS.items():
+            for column in columns:
+                assert column in registry.BY_NAME, f"{name} names {column!r}"
+
+    def test_full_means_whatever_the_registry_says(self) -> None:
+        assert train.FEATURE_SETS["full"] == ()
+
+    def test_every_stage_default_names_a_real_set(self) -> None:
+        for stage, name in train.DEFAULT_FEATURE_SET_BY_STAGE.items():
+            assert name in train.FEATURE_SETS, f"{stage} -> {name}"
+
+
+class TestRefreshPassesTheIncrementalFlagThrough:
+    """The weekly command is the one that has to stay inside the rate limit."""
+
+    @staticmethod
+    def _spy(monkeypatch):
+        seen: list[list[str]] = []
+
+        class FakeBuild:
+            @staticmethod
+            def main(argv):
+                seen.append(list(argv))
+                return 1  # stop before the refit; the argv is what is under test
+
+        import src.data.generate_dataset as real
+        monkeypatch.setattr(real, "main", FakeBuild.main)
+        return seen
+
+    def test_since_reaches_the_dataset_build(self, monkeypatch, capsys) -> None:
+        seen = self._spy(monkeypatch)
+        predict.main(["refresh", "--since", "2026"])
+        assert seen, "the build was never invoked"
+        assert "--since" in seen[0] and "2026" in seen[0]
+
+    def test_it_is_absent_when_not_asked_for(self, monkeypatch, capsys) -> None:
+        seen = self._spy(monkeypatch)
+        predict.main(["refresh"])
+        assert seen and "--since" not in seen[0]
+
+    def test_offline_still_composes_with_it(self, monkeypatch, capsys) -> None:
+        seen = self._spy(monkeypatch)
+        predict.main(["refresh", "--since", "2026", "--offline"])
+        assert "--since" in seen[0] and "--offline" in seen[0]
+
+    def test_no_download_skips_the_build_entirely(self, monkeypatch) -> None:
+        seen = self._spy(monkeypatch)
+        try:
+            predict.main(["refresh", "--no-download", "--since", "2026"])
+        except Exception:
+            pass  # it will fail later on a missing dataset; the build is the point
+        assert not seen, "--no-download still invoked the dataset build"
