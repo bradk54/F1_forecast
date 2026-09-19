@@ -21,6 +21,7 @@ They share the `Data/raw` fastf1 cache and nothing else.
 ./.venv/bin/python -m pytest -q                    # full suite
 ./.venv/bin/python -m src.data.generate_dataset --seasons 2018-2025
 ./.venv/bin/python -m scripts.write_data_dictionary # regenerate References/data_dictionary.md
+./.venv/bin/python -m scripts.write_team_lineage    # regenerate References/team_lineage.md
 ```
 
 Run notebooks with `jupyter lab` / `jupyter notebook` from the repo root.
@@ -59,6 +60,7 @@ src/config.py                 paths; every directory overridable by env var (F1_
 src/data/ingest.py            the ONLY module that touches the network
 src/data/generate_dataset.py  CLI orchestrator; runs the checks that gate a write
 src/data/circuits.py          static street/night/altitude reference
+src/data/teams.py             constructor lineage across renames, sales and insolvencies
 src/data/f1_loader.py         standalone self-auditing season loader
 src/features/labels.py        Status + ClassifiedPosition -> dnf and the cause taxonomy
 src/features/build_features.py  leakage-safe rolling history (driver/team/pairing/circuit)
@@ -175,6 +177,24 @@ Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Interme
   `add_race_context`, which inflates every prediction, so `predict` refuses
   `post_quali` without a grid rather than quietly producing those numbers.
 - **Sprints inform history but are not modelling rows.** A 100 km sprint and a 305 km grand prix do not share an attrition process.
+- **A renamed team is the same team, and `TeamId` does not know that.** Every
+  rolling team feature is keyed on `TeamId`, so a rebrand resets
+  `team_dnf_rate_10`, `team_points_rate_career` and `team_races_to_date` to
+  zero. Between 2006 and 2026 there were **25 changes of constructor name**
+  against **6 genuinely new teams**, and the resets land at the start of a
+  season, where the rolling window matters most: 2021 opens with Aston Martin
+  and Alpine apparently having never entered a race. Nothing reports it,
+  because a team with no history is indistinguishable from a team that is
+  new. `src/data/teams.py` is the bridge; `References/team_lineage.md` is the
+  readable form. It offers two groupings and does not choose between them:
+  `lineage_id` is the continuous *operation* (Aston Martin back to Jordan
+  1991), `(lineage_id, lineage_era)` is the continuous *record*, split at the
+  three insolvencies where the championship itself restarted the count --
+  Honda to Brawn (2009), Marussia to Manor (2015), Force India to Racing
+  Point (2019). **What this is worth to the model is not yet measured.** It is
+  reference data and a join, not a feature: nothing in `registry.py` uses it
+  yet, and the first thing to do with it is a walk-forward against the
+  `TeamId`-keyed features it would replace.
 - **A rebuild may not lose races.** Every other guard protects against bad rows;
   none notices missing ones. A rate-limited pull drops the rounds it cannot
   confirm, the survivors are all valid, and the status check passes on a dataset
