@@ -35,6 +35,14 @@ import pandas as pd
 
 Stage = Literal["pre_weekend", "post_quali", "race_day"]
 Kind = Literal["numeric", "categorical", "binary"]
+#: Where a feature is materialised.  ``dnf_dataset`` columns are written to
+#: ``Data/processed/dnf_dataset.parquet`` by the dataset build.  ``order_frame``
+#: columns are built in memory by :mod:`src.features.order_features` when the
+#: finishing-order model is fitted, because their half-lives are hyperparameters
+#: the tuning searches -- a stored column would freeze them.  Both kinds are
+#: registered here, because the stage tag is what matters and it applies to
+#: both.
+Table = Literal["dnf_dataset", "order_frame"]
 
 #: Stages in the order information arrives.  A model at one stage may use every
 #: feature from that stage and all earlier ones.
@@ -52,6 +60,7 @@ class Feature:
     #: False for features that are structural facts rather than history, so a
     #: missing value means a genuine data problem rather than a cold start.
     allows_cold_start_nan: bool = True
+    table: Table = "dnf_dataset"
 
 
 def _f(name: str, stage: Stage, kind: Kind, description: str, **kw) -> Feature:
@@ -342,6 +351,66 @@ FEATURES: tuple[Feature, ...] = (
     _f("rain_share", "race_day", "numeric",
        "Share of weather samples reporting rainfall."),
     _f("any_rain", "race_day", "binary", "Any rainfall recorded during the race."),
+
+    # ---- finishing order (built at fit time; see order_features.py) -------
+    # Percentiles are 0 for the front of the field and 1 for the back, so a
+    # lower value is always better.  Team history follows the organisation
+    # across rebrands (src/data/teams.py), and only grands prix feed it.
+    _f("team_grid_pct_ewma", "pre_weekend", "numeric",
+       "Team's grid percentile, exponentially weighted over prior races with a "
+       "tuned half-life; single-lap car pace, the cleanest available signal.",
+       table="order_frame"),
+    _f("team_finish_pct_ewma", "pre_weekend", "numeric",
+       "Team's finishing percentile among classified cars, exponentially "
+       "weighted over prior races; race pace, censored by retirements.",
+       table="order_frame"),
+    _f("team_gain_ewma", "pre_weekend", "numeric",
+       "Team's places gained from the grid net of regression to the mean, "
+       "exponentially weighted; positive for a car that races better than it "
+       "qualifies.", table="order_frame"),
+    _f("team_grid_pct_season", "pre_weekend", "numeric",
+       "Team's mean grid percentile so far this season only, reset every "
+       "winter; the contrast that tests whether pace carries across seasons.",
+       table="order_frame"),
+    _f("team_circuit_grid_residual_3", "pre_weekend", "numeric",
+       "How much better or worse than its prevailing form the team qualified on "
+       "its last three visits to this circuit; car-circuit suitability.",
+       table="order_frame"),
+    _f("driver_mate_grid_delta_ewma", "pre_weekend", "numeric",
+       "Driver's grid percentile minus the team-mate's, exponentially weighted "
+       "over prior races; negative for the quicker driver, and the only "
+       "measure of driver skill that controls for the car.", table="order_frame"),
+    _f("driver_mate_finish_delta_ewma", "pre_weekend", "numeric",
+       "Driver's finishing percentile minus the team-mate's, over prior races "
+       "where both were classified.", table="order_frame"),
+    _f("driver_gain_ewma", "pre_weekend", "numeric",
+       "Driver's places gained from the grid net of regression to the mean, "
+       "exponentially weighted over prior races.", table="order_frame"),
+    _f("driver_grid_pct_ewma", "pre_weekend", "numeric",
+       "Driver's own grid percentile, exponentially weighted over prior races; "
+       "car and driver together.", table="order_frame"),
+    _f("driver_mate_grid_delta_season", "pre_weekend", "numeric",
+       "Driver's grid percentile minus the team-mate's, averaged over this "
+       "season only; resets each winter, when a driver can change as much as "
+       "a car -- a rookie's second season above all.", table="order_frame"),
+    _f("driver_mate_finish_delta_season", "pre_weekend", "numeric",
+       "Driver's finishing percentile minus the team-mate's, this season only, "
+       "over races where both were classified.", table="order_frame"),
+    _f("circuit_grid_retention", "pre_weekend", "numeric",
+       "Spearman correlation of grid and finish at this circuit over prior "
+       "visits, shrunk toward the field mean.  Constant within a race, so it "
+       "can only act through an interaction.", table="order_frame"),
+    _f("log_grid_position", "post_quali", "numeric",
+       "Natural log of the starting position; lets a front-row gap be worth "
+       "more than a midfield one.", allows_cold_start_nan=False,
+       table="order_frame"),
+    _f("grid_x_circuit_retention", "post_quali", "numeric",
+       "Grid percentile times this circuit's excess grid retention over the "
+       "field mean; how much more grid slot matters here than usual.",
+       table="order_frame"),
+    _f("grid_x_rain_share", "race_day", "numeric",
+       "Grid percentile times observed rain share; how far rain reshuffles "
+       "the order.  Retrospective only.", table="order_frame"),
 )
 
 BY_NAME: dict[str, Feature] = {f.name: f for f in FEATURES}
@@ -397,6 +466,7 @@ def registry_frame() -> pd.DataFrame:
                 "stage": f.stage,
                 "kind": f.kind,
                 "allows_cold_start_nan": f.allows_cold_start_nan,
+                "table": f.table,
                 "description": f.description,
             }
             for f in FEATURES
@@ -436,10 +506,13 @@ def audit_coverage(frame: pd.DataFrame) -> pd.DataFrame:
     knowable on Saturday from being handed to a Monday model.
     """
     registered = set(BY_NAME)
+    # Order-model features are built at fit time and are never expected in the
+    # stored dataset, so their absence is not an issue worth reporting.
+    stored = {name for name, f in BY_NAME.items() if f.table == "dnf_dataset"}
     present = set(frame.columns)
     rows = [
         {"feature": name, "issue": "registered but missing from dataset"}
-        for name in sorted(registered - present)
+        for name in sorted(stored - present)
     ]
     numeric = {
         c
