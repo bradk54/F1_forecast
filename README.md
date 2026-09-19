@@ -24,6 +24,7 @@ python -m src.data.generate_dataset --skip-download
 
 pytest                                    # 125 tests, no network required
 python -m scripts.write_data_dictionary   # regenerate References/data_dictionary.md
+python -m scripts.write_team_lineage      # regenerate References/team_lineage.md
 ```
 
 The first build downloads one telemetry session per event and takes 30–60 minutes on a
@@ -105,6 +106,12 @@ sprint and a 305 km grand prix do not share an attrition process.
 
 Full column-by-column reference: [`References/data_dictionary.md`](References/data_dictionary.md).
 
+Teams are renamed far more often than they are founded — 25 changes of constructor name
+between 2006 and 2026, against 6 genuinely new teams — and every rolling team feature is
+keyed on `TeamId`, so a rename silently resets it.
+[`References/team_lineage.md`](References/team_lineage.md) bridges them, and
+`src.data.teams.attach_lineage` is the join.
+
 ### Evaluating it
 
 **Accuracy is the wrong metric and nothing here reports it.** About one car in seven
@@ -137,17 +144,20 @@ independent.
 |
 |- References
 |  |- data_dictionary.md    <- generated from the feature registry
+|  |- team_lineage.md       <- generated from the constructor lineage table
 |
 |- Reports/figures
 |
 |- scripts
 |  |- write_data_dictionary.py
+|  |- write_team_lineage.py
 |
 |- src
 |  |- config.py             <- repo-relative paths and pipeline constants
 |  |- data
 |  |  |- ingest.py          <- FastF1 loading; the only module that hits the network
 |  |  |- circuits.py        <- curated circuit reference (street / night / altitude)
+|  |  |- teams.py           <- constructor lineage across renames and sales
 |  |  |- generate_dataset.py<- CLI orchestrator
 |  |- features
 |  |  |- labels.py          <- classification codes -> modelling targets
