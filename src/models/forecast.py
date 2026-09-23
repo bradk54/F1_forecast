@@ -267,7 +267,26 @@ def cmd_tune(args) -> int:
     return 0
 
 
-def _season_setup(dataset, results, profiles, year, through_round, offline=True):
+def current_position(
+    dataset: pd.DataFrame, year: int | None = None, through_round: int | None = None,
+) -> tuple[int, int]:
+    """``(year, last completed round)``: the point a forecast is made from.
+
+    Defaults to the newest race in the dataset, which is what every live
+    command means by "now".
+    """
+    year = year or int(dataset["Year"].max())
+    through = through_round or int(dataset.loc[dataset["Year"] == year, "RoundNumber"].max())
+    return year, through
+
+
+def season_setup(dataset, results, profiles, year, through_round, offline=True):
+    """Everything a season simulation or a pre-weekend race forecast starts from.
+
+    A completed season's calendar is read from its own results; a live one from
+    the FastF1 schedule, which is offline by default so that a calendar lookup
+    never spends a request against the hourly limit.
+    """
     races = season.remaining_races(results, year, through_round)
     if races.empty:
         races = season.remaining_races_from_schedule(year, through_round, offline=offline)
@@ -276,14 +295,57 @@ def _season_setup(dataset, results, profiles, year, through_round, offline=True)
         races=races, spec=PRE_WEEKEND_SPEC, feature_config=PRE_WEEKEND_FEATURES)
 
 
+def championship(
+    setup: season.SeasonSetup, *, noise: season.SeasonNoise = DEFAULT_SEASON_NOISE,
+    trials: int = season.DEFAULT_TRIALS,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Both championships: ``(drivers, constructors)`` with the distribution and odds."""
+    return season.summarise(season.simulate(setup, n_trials=trials, noise=noise))
+
+
+def pre_weekend_outlook(setup: season.SeasonSetup, *, trials: int = season.DEFAULT_TRIALS):
+    """The next unraced round, per driver, from the model fitted without a grid."""
+    return season.race_outlook(setup, n_samples=trials)
+
+
+def post_quali_outlook(
+    dataset, results, profiles, *, year: int, round_number: int, race_date,
+    event_name: str, grid: dict[str, float], trials: int = season.DEFAULT_TRIALS,
+) -> pd.DataFrame:
+    """One race from a real grid, by a model fitted only on the races before it."""
+    return season.saturday_outlook(
+        dataset, results, profiles, year=year, round_number=round_number,
+        race_date=race_date, event_name=event_name, grid=grid,
+        spec=POST_QUALI_SPEC, feature_config=POST_QUALI_FEATURES, n_samples=trials)
+
+
+def backtest_race(
+    dataset, results, profiles, year: int, round_number: int,
+    trials: int = season.DEFAULT_TRIALS,
+) -> pd.DataFrame:
+    """A completed race forecast from its real grid, beside what happened.
+
+    ``finished`` is the classified position, blank for a car that did not
+    finish.  Raises ``ValueError`` for a race that is not in the dataset.
+    """
+    rows = dataset.loc[(dataset["Year"] == year) & (dataset["RoundNumber"] == round_number)]
+    if rows.empty:
+        raise ValueError(f"{year} R{round_number} is not in the dataset")
+    table = post_quali_outlook(
+        dataset, results, profiles, year=year, round_number=round_number,
+        race_date=rows[order_eval.ORDER_COL].iloc[0], event_name=rows["EventName"].iloc[0],
+        grid=dict(zip(rows["DriverId"], rows["grid_position"])), trials=trials)
+    finished = pd.to_numeric(rows.set_index("Abbreviation")["ClassifiedPosition"],
+                             errors="coerce")
+    return table.assign(finished=table["Abbreviation"].map(finished))
+
+
 def cmd_season(args) -> int:
     dataset, results, profiles = load()
-    year = args.year or int(dataset["Year"].max())
-    through = args.through_round or int(dataset.loc[dataset["Year"] == year, "RoundNumber"].max())
-    setup = _season_setup(dataset, results, profiles, year, through, offline=not args.online)
+    year, through = current_position(dataset, args.year, args.through_round)
+    setup = season_setup(dataset, results, profiles, year, through, offline=not args.online)
     noise = season.SeasonNoise(args.team_sd, args.driver_sd)
-    draws = season.simulate(setup, n_trials=args.trials, noise=noise)
-    drivers, teams = season.summarise(draws)
+    drivers, teams = championship(setup, noise=noise, trials=args.trials)
     left = ", ".join(f"R{r.RoundNumber} {r.EventName.replace(' Grand Prix', '')}"
                      f"{' (sprint)' if r.has_sprint else ''}"
                      for r in setup.races.itertuples())
@@ -318,15 +380,14 @@ def _print_outlook(title: str, table: pd.DataFrame) -> None:
 
 def cmd_next(args) -> int:
     dataset, results, profiles = load()
-    year = int(dataset["Year"].max())
-    through = int(dataset.loc[dataset["Year"] == year, "RoundNumber"].max())
-    setup = _season_setup(dataset, results, profiles, year, through, offline=not args.online)
+    year, through = current_position(dataset)
+    setup = season_setup(dataset, results, profiles, year, through, offline=not args.online)
     race = setup.races.iloc[0]
     if args.stage == "pre_weekend":
         _print_outlook(
             f"{year} R{race.RoundNumber} {race.EventName} -- pre-weekend forecast "
             f"(no grid; run with --stage post_quali after qualifying)",
-            season.race_outlook(setup, n_samples=args.trials))
+            pre_weekend_outlook(setup, trials=args.trials))
         return 0
 
     from src.models import predict
@@ -338,10 +399,10 @@ def cmd_next(args) -> int:
               "default --stage pre_weekend: a model fitted without the grid.",
               file=sys.stderr)
         return 3
-    table = season.saturday_outlook(
+    table = post_quali_outlook(
         dataset, results, profiles, year=year, round_number=int(race.RoundNumber),
         race_date=race.RaceDate, event_name=race.EventName, grid=grid,
-        spec=POST_QUALI_SPEC, feature_config=POST_QUALI_FEATURES, n_samples=args.trials)
+        trials=args.trials)
     _print_outlook(f"{year} R{race.RoundNumber} {race.EventName} -- post-qualifying "
                    "forecast (grid = qualifying order; penalties not yet applied)", table)
     return 0
@@ -350,21 +411,15 @@ def cmd_next(args) -> int:
 def cmd_race(args) -> int:
     """A completed race, forecast from its real grid by a model that never saw it."""
     dataset, results, profiles = load()
-    rows = dataset.loc[(dataset["Year"] == args.year) & (dataset["RoundNumber"] == args.round)]
-    if rows.empty:
+    try:
+        table = backtest_race(dataset, results, profiles, args.year, args.round, args.trials)
+    except ValueError:
         print(f"error: {args.year} R{args.round} is not in the dataset; for an "
               "upcoming race use `next`", file=sys.stderr)
         return 1
-    grid = dict(zip(rows["DriverId"], rows["grid_position"]))
-    table = season.saturday_outlook(
-        dataset, results, profiles, year=args.year, round_number=args.round,
-        race_date=rows[order_eval.ORDER_COL].iloc[0], event_name=rows["EventName"].iloc[0],
-        grid=grid, spec=POST_QUALI_SPEC, feature_config=POST_QUALI_FEATURES,
-        n_samples=args.trials)
-    finished = pd.to_numeric(rows.set_index("Abbreviation")["ClassifiedPosition"],
-                             errors="coerce")
-    table["finished"] = table["Abbreviation"].map(finished)
-    _print_outlook(f"{args.year} R{args.round} {rows['EventName'].iloc[0]} -- backtest: "
+    event = dataset.loc[(dataset["Year"] == args.year)
+                        & (dataset["RoundNumber"] == args.round), "EventName"].iloc[0]
+    _print_outlook(f"{args.year} R{args.round} {event} -- backtest: "
                    "fitted only on earlier races, scored against what happened "
                    "(blank = did not finish)", table)
     return 0
@@ -392,7 +447,7 @@ def backtest(
         for cut in cutoffs:
             if cut >= last:
                 continue
-            setup = _season_setup(dataset, results, profiles, year, cut)
+            setup = season_setup(dataset, results, profiles, year, cut)
             for noise in noises:
                 draws = season.simulate(setup, n_trials=n_trials, noise=noise)
                 scored.append(season.score_season(draws, results).assign(

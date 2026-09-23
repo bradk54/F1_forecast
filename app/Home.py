@@ -179,5 +179,6 @@ st.divider()
 st.caption(
     "Pages: **Race weekend** ranks a grid · **Model health** reads the log · "
     "**Lab** runs walk-forward, ablation and importance · **Data explorer** "
-    "browses the dataset and the feature registry."
+    "browses the dataset and the feature registry · **Forecast** runs the "
+    "finishing-order model this one feeds: the next race and both championships."
 )

@@ -229,3 +229,23 @@ def fmt_pct(value: float) -> str:
 
 def fmt_num(value: float, places: int = 3) -> str:
     return "—" if pd.isna(value) else f"{value:.{places}f}"
+
+
+def format_odds(p: float) -> str:
+    """How a championship or podium probability is printed.
+
+    This is a judgement about false precision, and the data for it is on the
+    Forecast page: the season simulation's 80% intervals held the true total
+    only 70% (drivers) and 73% (constructors) of the time in the 2024-25
+    backtest, so its extreme odds are *more confident than the evidence*.
+    Printing 99.94% as ``99.9%`` or 0.03% as ``0.0%`` claims a resolution the
+    model has not earned.
+
+    Used for every odds column on the page, so one rule decides them all.
+    """
+    # Open decision: this is plain one-decimal formatting for now.  Candidates
+    # are capping the tails (``<1%`` / ``>99%``), whole percentages, or "1 in N"
+    # odds; whichever is chosen, a true zero (no path to the title) should
+    # probably still print as zero.
+    return fmt_pct(p)
+
