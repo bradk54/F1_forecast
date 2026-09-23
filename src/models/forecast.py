@@ -103,6 +103,29 @@ BOOSTED_PARAMS: tuple[tuple[str, object], ...] = (
 _UNTUNED = dict(l2=1.0, lookback_races=60, truncate=None, race_halflife=None,
                 n_scales=0)
 
+#: Measured.  Chosen for :func:`src.models.season.draw_trial_offsets`'s
+#: correlated pace offsets by ``forecast backtest`` on 2021-2023 (search) and
+#: checked on 2024-2025, the seasons that actually contain a mid-season order
+#: shift (McLaren's 2024 rise).  The two disagreed on what "enough" looks
+#: like: on the calm development seasons, driver accuracy (``crps``,
+#: ``brier_champion``) peaked around ``team_sd`` 0.2-0.3 and got worse by 0.5;
+#: on the holdout seasons every metric, for both drivers and constructors,
+#: kept improving all the way to 0.5 -- the top value tried -- with no sign of
+#: plateauing.  0.5 is chosen over the dev-optimal value because a
+#: regime-shift season is exactly what this model exists to forecast, and
+#: 2026 (Mercedes' rise from behind) looks like one; a value tuned only to
+#: calm seasons would understate it.
+#:
+#: Provisional, not final.  Even at 0.5, 80% coverage on the holdout seasons
+#: reaches only 0.733 for constructors and 0.701 for drivers -- both still
+#: short of 0.80 -- and constructors are consistently the harder of the two:
+#: two team-mates share one team offset, so nothing here diversifies a team's
+#: total the way independent per-driver noise would.  ``driver_sd`` stays 0
+#: because ``draw_trial_offsets`` does not use it yet.  Re-run
+#: ``forecast backtest`` once it does, and again whenever the training window
+#: is re-tuned.  Full tables: ``References/points_model_results.md`` Sec 10.
+DEFAULT_SEASON_NOISE = season.SeasonNoise(team_sd=0.5, driver_sd=0.0)
+
 
 def ladder(stage: str) -> list[tuple[OrderSpec, OrderFeatureConfig]]:
     """Every model the held-out evaluation compares, cheapest first.
@@ -424,8 +447,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--year", type=int)
     p.add_argument("--through-round", type=int)
     p.add_argument("--trials", type=int, default=season.DEFAULT_TRIALS)
-    p.add_argument("--team-sd", type=float, default=0.0)
-    p.add_argument("--driver-sd", type=float, default=0.0)
+    p.add_argument("--team-sd", type=float, default=DEFAULT_SEASON_NOISE.team_sd)
+    p.add_argument("--driver-sd", type=float, default=DEFAULT_SEASON_NOISE.driver_sd)
     p.add_argument("--online", action="store_true",
                    help="allow a network lookup for the calendar")
     p.add_argument("--write", action="store_true")

@@ -163,7 +163,7 @@ Each one can be wrong. The right-hand column is how you would find out.
 | 9 | sprints share the grand-prix strengths | a car built for one-lap or long-run pace | sprint-weekend errors (not measured separately) |
 | 10 | the coefficients hold across the last 100 races | a regulation change | re-run `tune` each winter |
 | 11 | a driver's skill is their grid against the team-mate, over ~24 races | a rookie improving; a grid penalty | **known live case**: Antonelli is under-rated in 2026 (results §11) |
-| 12 | season races are independent draws around today's order | any season where the order moves | **known**: intervals too narrow until correlated offsets land (results §10) |
+| 12 | a team's pace drifts as one random walk shared by both cars, and nothing else moves independently | a season where the order moves faster than `team_sd` allows, or one team-mate moving on their own | **known**: at the shipped `team_sd` 0.5, holdout 80% coverage is still 0.73 (constructors) and 0.70 (drivers); `driver_sd` is not applied yet (results §10) |
 
 ---
 
@@ -260,16 +260,26 @@ Remember that a feature constant within a race (circuit, weather, calendar)
 ### 6.4 Tuning the season noise
 
 The season simulation's correlated pace offsets (`draw_trial_offsets`) have
-scales in `SeasonNoise`. Choose them on completed development seasons, then
-check on later ones:
+scales in `SeasonNoise`; the shipped default lives in
+`forecast.DEFAULT_SEASON_NOISE` (currently `team_sd=0.5`, `driver_sd=0.0`),
+with the evidence for it in the comment above it. To re-tune, choose on
+completed development seasons, then check on later ones:
 
 ```bash
 ./.venv/bin/python -m src.models.forecast backtest --seasons 2021 2022 2023 \
-    --team-sd 0 0.1 0.2 0.3 --driver-sd 0 0.1
-./.venv/bin/python -m src.models.forecast backtest --seasons 2024 2025 --team-sd <chosen> --driver-sd <chosen>
+    --team-sd 0 0.1 0.2 0.3 0.5 --driver-sd 0
+./.venv/bin/python -m src.models.forecast backtest --seasons 2024 2025 \
+    --team-sd 0 0.2 0.3 0.5 --driver-sd 0
 ```
 
-Aim for `coverage80` near 0.80, `pit_sd` near 0.289, and the lowest `crps`.
+Sweep `--driver-sd` only once `draw_trial_offsets` uses it. It is a no-op today,
+and a sweep over it would report identical rows.
+
+Aim for `coverage80` near 0.80, `pit_sd` near 0.289, and the lowest `crps` —
+and expect them not to agree. On the calm 2021–2023 seasons `crps` bottomed
+out near `team_sd` 0.2–0.3 while coverage kept rising; on 2024–2025 every
+metric kept improving through 0.5. The default was chosen for the
+regime-shift case (results §10).
 
 ---
 

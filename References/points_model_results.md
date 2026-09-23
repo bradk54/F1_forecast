@@ -346,13 +346,47 @@ season in which **the running order moves**, which the frozen, independent
 simulation cannot represent. Constructors suffer most because a team's total is
 two cars sharing one car's pace, so the missing component dominates it.
 
-**The fix is correlated pace offsets within a trial** (`draw_trial_offsets`),
-with their scale tuned by this same backtest on 2021–2023 and checked on
-2024–2025. That work is in progress; until it lands, treat every season
-interval as too narrow.
+**Correlated pace offsets close much of the gap, but not all of it.**
+`draw_trial_offsets` now carries each team's pace as a random walk shared by
+both of its cars (`np.cumsum` of Gaussian steps, broadcast onto drivers
+through `team_index`), so team-mates move together and an upgrade compounds
+into every later race rather than each race redrawing independently. Its
+scale was swept on 2021–2023 and checked on 2024–25 — the seasons with an
+actual mid-season order shift, McLaren's 2024 rise:
 
-For the record, the naive 2026 forecast after R14 (independent races — **do
-not quote it**): Antonelli 84%, Russell 16%; Mercedes 100% for constructors.
+| `team_sd` | dev driver crps | dev driver coverage | holdout driver coverage | holdout constructor coverage |
+| --- | --- | --- | --- | --- |
+| 0.0 | 11.57 | 0.770 | 0.561 | 0.483 |
+| 0.2 | 11.53 | 0.793 | 0.607 | 0.500 |
+| **0.3** | **11.56** | 0.833 | 0.645 | 0.600 |
+| 0.5 | 11.80 | 0.868 | **0.701** | **0.733** |
+
+The two periods disagree on what "enough" looks like. On the calm dev
+seasons, driver accuracy peaks around 0.2–0.3 and gets worse by 0.5. On the
+holdout seasons every metric, for both drivers and constructors, keeps
+improving all the way to 0.5 — the top value tried — with no sign of
+plateauing. **0.5 was chosen** (`forecast.DEFAULT_SEASON_NOISE`) because a
+regime-shift season is exactly what this model exists to forecast, and a
+value tuned only to calm seasons would understate precisely the case that
+matters.
+
+It is provisional, not final. Even at 0.5, 80% coverage on the holdout
+seasons reaches only 0.733 for constructors and 0.701 for drivers — both
+still short of 0.80 — and constructors remain the harder of the two: two
+team-mates share one team offset, so nothing here diversifies a team's total
+the way independent per-driver noise would. `driver_sd` exists in
+`SeasonNoise` and stays 0 because `draw_trial_offsets` does not use it yet;
+that is the next lever, and it should move constructor coverage without
+needing `team_sd` any higher than it already is.
+
+The 2026 forecast after R14, with the shipped default: Antonelli 85%
+(84% under the old independent-race assumption), Russell 10% (16% before);
+Mercedes 97% for constructors (100% before). The roughly 5 points of drivers'
+title probability that came off the Mercedes pair went to Norris (2.8%),
+Leclerc (1.2%) and Hamilton (0.7%) — outcomes the independent-race simulation
+gave no chance at all — and Ferrari and McLaren now hold 2.4% and 0.5% of the
+constructors' title between them. Mercedes is still the clear favourite. Read
+constructors' 97% as an upper bound until `driver_sd` lands.
 
 ---
 

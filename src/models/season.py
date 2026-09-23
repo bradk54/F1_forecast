@@ -108,7 +108,20 @@ def draw_trial_offsets(
             can share a draw.
         noise: The scales to draw at.
     """
-    return np.zeros((n_trials, n_races, len(team_index)))
+    n_teams = int(team_index.max()) + 1
+    team_step = rng.normal(0.0, noise.team_sd, size=(n_trials, n_races, n_teams))
+    # A random walk, not one fixed shift: cumsum lets an upgrade compound, so a
+    # race in December carries more spread than next week's, rather than every
+    # remaining race sharing a single draw.  Noise 0 gives steps of 0, so the
+    # cumsum is 0 too -- the zero-noise contract holds without a special case.
+    team_offset = np.cumsum(team_step, axis=1)
+    # Broadcast each team's walk out to its cars: team_index[i] names driver
+    # i's team, so indexing the last axis with it duplicates that team's
+    # column onto every driver who races for it -- team-mates move together.
+    #
+    # noise.driver_sd is not applied yet -- team movement first; an
+    # independent per-driver term on top of it is the natural next step.
+    return team_offset[..., team_index]
 
 
 # --------------------------------------------------------------------------- #
@@ -122,15 +135,15 @@ class SeasonSetup:
 
     year: int
     through_round: int
-    drivers: pd.DataFrame       # one row per simulated entrant, with points_so_far
-    others: pd.DataFrame        # drivers with points this season who no longer race
-    teams: pd.DataFrame         # one row per constructor, with points_so_far
-    races: pd.DataFrame         # remaining rounds, with has_sprint
-    strength: np.ndarray        # (bootstrap, races, drivers)
-    alpha: np.ndarray | None    # (bootstrap, width) stage scales, if stagewise
-    p_dnf: np.ndarray           # (drivers,) grand-prix retirement probability
-    p_dns: float                # chance an entrant does not start
-    team_index: np.ndarray      # (drivers,) row of ``teams`` each driver scores for
+    drivers: pd.DataFrame  # one row per simulated entrant, with points_so_far
+    others: pd.DataFrame  # drivers with points this season who no longer race
+    teams: pd.DataFrame  # one row per constructor, with points_so_far
+    races: pd.DataFrame  # remaining rounds, with has_sprint
+    strength: np.ndarray  # (bootstrap, races, drivers)
+    alpha: np.ndarray | None  # (bootstrap, width) stage scales, if stagewise
+    p_dnf: np.ndarray  # (drivers,) grand-prix retirement probability
+    p_dns: float  # chance an entrant does not start
+    team_index: np.ndarray  # (drivers,) row of ``teams`` each driver scores for
 
 
 def standings(
@@ -143,19 +156,29 @@ def standings(
     keyed on the name raced under at the time, so a driver who changed teams
     mid-season credits each team with the races run for it.
     """
-    rows = results.loc[(results["Year"] == year) & (results["RoundNumber"] <= through_round)]
-    return (rows.groupby("DriverId")["Points"].sum(),
-            rows.groupby("TeamName")["Points"].sum())
+    rows = results.loc[
+        (results["Year"] == year) & (results["RoundNumber"] <= through_round)
+    ]
+    return (
+        rows.groupby("DriverId")["Points"].sum(),
+        rows.groupby("TeamName")["Points"].sum(),
+    )
 
 
-def remaining_races(results: pd.DataFrame, year: int, through_round: int) -> pd.DataFrame:
+def remaining_races(
+    results: pd.DataFrame, year: int, through_round: int
+) -> pd.DataFrame:
     """The rest of a completed season's calendar, read from its own results."""
-    rows = results.loc[(results["Year"] == year) & (results["RoundNumber"] > through_round)]
+    rows = results.loc[
+        (results["Year"] == year) & (results["RoundNumber"] > through_round)
+    ]
     sprint = set(rows.loc[rows["session_type"] == "S", "RoundNumber"])
     gp = rows.loc[rows["session_type"] == "R"]
-    races = (gp.groupby("RoundNumber")
-             .agg(EventName=("EventName", "first"), RaceDate=(ORDER_COL, "first"))
-             .reset_index())
+    races = (
+        gp.groupby("RoundNumber")
+        .agg(EventName=("EventName", "first"), RaceDate=(ORDER_COL, "first"))
+        .reset_index()
+    )
     races["has_sprint"] = races["RoundNumber"].isin(sprint)
     return races
 
@@ -175,16 +198,19 @@ def remaining_races_from_schedule(
     ingest.configure(offline=offline)
     schedule = fastf1.get_event_schedule(year, include_testing=False)
     upcoming = schedule.loc[schedule["RoundNumber"] > through_round]
-    return pd.DataFrame({
-        "RoundNumber": upcoming["RoundNumber"].astype(int).to_numpy(),
-        "EventName": upcoming["EventName"].astype(str).to_numpy(),
-        "RaceDate": pd.to_datetime(upcoming["EventDate"]).to_numpy(),
-        "has_sprint": [ingest.event_has_sprint(e) for _, e in upcoming.iterrows()],
-    })
+    return pd.DataFrame(
+        {
+            "RoundNumber": upcoming["RoundNumber"].astype(int).to_numpy(),
+            "EventName": upcoming["EventName"].astype(str).to_numpy(),
+            "RaceDate": pd.to_datetime(upcoming["EventDate"]).to_numpy(),
+            "has_sprint": [ingest.event_has_sprint(e) for _, e in upcoming.iterrows()],
+        }
+    )
 
 
-def _placeholders(entries: pd.DataFrame, races: pd.DataFrame,
-                  history: pd.DataFrame) -> pd.DataFrame:
+def _placeholders(
+    entries: pd.DataFrame, races: pd.DataFrame, history: pd.DataFrame
+) -> pd.DataFrame:
     """Unraced rows for every remaining race, so features can be built for them.
 
     Every order feature is strictly prior-race, so a placeholder's own blank
@@ -254,34 +280,54 @@ def prepare_season(
             parameter uncertainty.
     """
     if spec.stage != "pre_weekend":
-        raise ValueError("a season forecast needs a pre_weekend spec: future "
-                         f"races have no grid, and {spec.name!r} is {spec.stage}")
+        raise ValueError(
+            "a season forecast needs a pre_weekend spec: future "
+            f"races have no grid, and {spec.name!r} is {spec.stage}"
+        )
     if races.empty:
         raise ValueError(f"no races left in {year} after round {through_round}")
 
     seen = (results["Year"] < year) | (
-        (results["Year"] == year) & (results["RoundNumber"] <= through_round))
+        (results["Year"] == year) & (results["RoundNumber"] <= through_round)
+    )
     past_results = results.loc[seen]
-    past = dataset.loc[(dataset["Year"] < year) | (
-        (dataset["Year"] == year) & (dataset["RoundNumber"] <= through_round))]
+    past = dataset.loc[
+        (dataset["Year"] < year)
+        | ((dataset["Year"] == year) & (dataset["RoundNumber"] <= through_round))
+    ]
 
-    last = past_results.loc[(past_results["Year"] == year)
-                            & (past_results["RoundNumber"] == through_round)
-                            & (past_results["session_type"] == "R")]
-    entries = (last[["DriverId", "Abbreviation", "TeamId", "TeamName"]]
-               .drop_duplicates("DriverId").reset_index(drop=True))
+    last = past_results.loc[
+        (past_results["Year"] == year)
+        & (past_results["RoundNumber"] == through_round)
+        & (past_results["session_type"] == "R")
+    ]
+    entries = (
+        last[["DriverId", "Abbreviation", "TeamId", "TeamName"]]
+        .drop_duplicates("DriverId")
+        .reset_index(drop=True)
+    )
     entries["Year"] = year
 
     frame = add_order_features(
-        pd.concat([past, _placeholders(entries, races, past_results)], ignore_index=True),
-        feature_config)
-    future = frame.loc[frame["ClassifiedPosition"].isna()
-                       & (frame["Year"] == year) & (frame["RoundNumber"] > through_round)]
+        pd.concat(
+            [past, _placeholders(entries, races, past_results)], ignore_index=True
+        ),
+        feature_config,
+    )
+    future = frame.loc[
+        frame["ClassifiedPosition"].isna()
+        & (frame["Year"] == year)
+        & (frame["RoundNumber"] > through_round)
+    ]
 
     train, calendar = _training_rows(frame, past, spec)
-    blocks = [future.loc[future["RoundNumber"] == race.RoundNumber]
-              .set_index("DriverId").loc[entries["DriverId"]].reset_index()
-              for race in races.itertuples(index=False)]
+    blocks = [
+        future.loc[future["RoundNumber"] == race.RoundNumber]
+        .set_index("DriverId")
+        .loc[entries["DriverId"]]
+        .reset_index()
+        for race in races.itertuples(index=False)
+    ]
     strength, alpha = _bootstrap_strengths(train, spec, blocks, n_boot, seed)
 
     # Attrition: the DNF model at its pre-weekend configuration, through the
@@ -292,35 +338,57 @@ def prepare_season(
     first = races.iloc[0]
     with _quiet("src.features.labels", "src.data.generate_dataset"):
         rows = predict.build_inference_rows(
-            past_results, profiles, year=year, round_number=int(first.RoundNumber),
-            race_date=first.RaceDate, event_name=first.EventName,
-            entries=entries[["DriverId", "TeamId"]])
-    p_dnf = (pd.Series(estimator.predict_proba(rows[selected])[:, 1],
-                       index=rows["DriverId"])
-             .reindex(entries["DriverId"]).fillna(float(past["dnf"].mean())).to_numpy())
+            past_results,
+            profiles,
+            year=year,
+            round_number=int(first.RoundNumber),
+            race_date=first.RaceDate,
+            event_name=first.EventName,
+            entries=entries[["DriverId", "TeamId"]],
+        )
+    p_dnf = (
+        pd.Series(estimator.predict_proba(rows[selected])[:, 1], index=rows["DriverId"])
+        .reindex(entries["DriverId"])
+        .fillna(float(past["dnf"].mean()))
+        .to_numpy()
+    )
 
     with _quiet("src.features.labels"):
         labelled = add_race_outcome_labels(
-            past_results.loc[past_results["session_type"] == "R"])
+            past_results.loc[past_results["session_type"] == "R"]
+        )
     recent = labelled.merge(calendar[list(RACE_KEYS)], on=list(RACE_KEYS), how="inner")
     p_dns = float(1 - recent["started"].mean()) if len(recent) else 0.0
 
     driver_pts, team_pts = standings(results, year, through_round)
     entries["points_so_far"] = entries["DriverId"].map(driver_pts).fillna(0.0)
-    others = (driver_pts.drop(entries["DriverId"], errors="ignore")
-              .rename("points_so_far").reset_index())
-    others = others.join(_latest_names(past_results.loc[past_results["Year"] == year]),
-                         on="DriverId")
+    others = (
+        driver_pts.drop(entries["DriverId"], errors="ignore")
+        .rename("points_so_far")
+        .reset_index()
+    )
+    others = others.join(
+        _latest_names(past_results.loc[past_results["Year"] == year]), on="DriverId"
+    )
     team_names = sorted(set(team_pts.index) | set(entries["TeamName"]))
     teams = pd.DataFrame({"TeamName": team_names})
     teams["points_so_far"] = teams["TeamName"].map(team_pts).fillna(0.0)
-    team_index = teams.reset_index().set_index("TeamName").loc[entries["TeamName"], "index"]
+    team_index = (
+        teams.reset_index().set_index("TeamName").loc[entries["TeamName"], "index"]
+    )
 
     return SeasonSetup(
-        year=year, through_round=through_round, drivers=entries, others=others,
-        teams=teams, races=races.reset_index(drop=True),
-        strength=strength, alpha=alpha,
-        p_dnf=p_dnf, p_dns=p_dns, team_index=team_index.to_numpy(),
+        year=year,
+        through_round=through_round,
+        drivers=entries,
+        others=others,
+        teams=teams,
+        races=races.reset_index(drop=True),
+        strength=strength,
+        alpha=alpha,
+        p_dnf=p_dnf,
+        p_dns=p_dns,
+        team_index=team_index.to_numpy(),
     )
 
 
@@ -332,27 +400,37 @@ def _latest_names(results: pd.DataFrame) -> pd.DataFrame:
     seat "Red Bull Racing".
     """
     ordered = results.sort_values([ORDER_COL, "RoundNumber"], kind="mergesort")
-    return (ordered.drop_duplicates("DriverId", keep="last")
-            .set_index("DriverId")[["Abbreviation", "TeamName"]])
+    return ordered.drop_duplicates("DriverId", keep="last").set_index("DriverId")[
+        ["Abbreviation", "TeamName"]
+    ]
 
 
 def _training_rows(
     frame: pd.DataFrame, past: pd.DataFrame, spec: OrderSpec
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """The spec's lookback over completed races, ages counted back from now."""
-    calendar = (past[[*RACE_KEYS, ORDER_COL]].drop_duplicates()
-                .sort_values(ORDER_COL).reset_index(drop=True))
+    calendar = (
+        past[[*RACE_KEYS, ORDER_COL]]
+        .drop_duplicates()
+        .sort_values(ORDER_COL)
+        .reset_index(drop=True)
+    )
     if spec.lookback_races is not None:
         calendar = calendar.tail(spec.lookback_races)
     calendar["age"] = np.arange(len(calendar), 0, -1)
     train = frame.merge(calendar[[*RACE_KEYS, "age"]], on=list(RACE_KEYS), how="inner")
-    train = train.loc[pd.to_numeric(train["ClassifiedPosition"], errors="coerce").notna()]
+    train = train.loc[
+        pd.to_numeric(train["ClassifiedPosition"], errors="coerce").notna()
+    ]
     return train, calendar
 
 
 def _bootstrap_strengths(
-    train: pd.DataFrame, spec: OrderSpec, blocks: list[pd.DataFrame],
-    n_boot: int, seed: int,
+    train: pd.DataFrame,
+    spec: OrderSpec,
+    blocks: list[pd.DataFrame],
+    n_boot: int,
+    seed: int,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Refit on Bayesian-bootstrap race weights; strengths for every block.
 
@@ -369,8 +447,11 @@ def _bootstrap_strengths(
     rng = np.random.default_rng(seed)
     codes = pd.factorize(pd.MultiIndex.from_frame(train[list(RACE_KEYS)]))[0]
     n_races = codes.max() + 1
-    weights = ([None] if n_boot == 0 else
-               [rng.dirichlet(np.ones(n_races))[codes] * n_races for _ in range(n_boot)])
+    weights = (
+        [None]
+        if n_boot == 0
+        else [rng.dirichlet(np.ones(n_races))[codes] * n_races for _ in range(n_boot)]
+    )
     strength, alpha = [], []
     for w in weights:
         model = fit_order_model(train, spec, age=train["age"].to_numpy(), weight=w)
@@ -410,46 +491,82 @@ def saturday_outlook(
             for a backtest.
     """
     if spec.stage != "post_quali":
-        raise ValueError(f"{spec.name!r} is {spec.stage}; a Saturday forecast "
-                         "needs the post_quali spec")
+        raise ValueError(
+            f"{spec.name!r} is {spec.stage}; a Saturday forecast "
+            "needs the post_quali spec"
+        )
     before = lambda f: (f["Year"] < year) | (  # noqa: E731
-        (f["Year"] == year) & (f["RoundNumber"] < round_number))
+        (f["Year"] == year) & (f["RoundNumber"] < round_number)
+    )
     past, past_results = dataset.loc[before(dataset)], results.loc[before(results)]
     entries = predict.entry_list(past_results)
     entries = entries.loc[entries["DriverId"].isin(grid)].reset_index(drop=True)
 
     with _quiet("src.features.labels", "src.data.generate_dataset"):
         rows = predict.build_inference_rows(
-            past_results, profiles, year=year, round_number=round_number,
-            race_date=race_date, event_name=event_name, entries=entries, grid=grid)
-    frame = add_order_features(pd.concat([past, rows], ignore_index=True), feature_config)
-    upcoming = (frame.loc[(frame["Year"] == year) & (frame["RoundNumber"] == round_number)]
-                .set_index("DriverId").loc[entries["DriverId"]].reset_index())
+            past_results,
+            profiles,
+            year=year,
+            round_number=round_number,
+            race_date=race_date,
+            event_name=event_name,
+            entries=entries,
+            grid=grid,
+        )
+    frame = add_order_features(
+        pd.concat([past, rows], ignore_index=True), feature_config
+    )
+    upcoming = (
+        frame.loc[(frame["Year"] == year) & (frame["RoundNumber"] == round_number)]
+        .set_index("DriverId")
+        .loc[entries["DriverId"]]
+        .reset_index()
+    )
 
     train, _ = _training_rows(frame.loc[before(frame)], past, spec)
     strength, alpha = _bootstrap_strengths(train, spec, [upcoming], n_boot, seed)
 
     estimator, _, selected = predict.fit_current(past, stage="post_quali")
-    p_dnf = (pd.Series(estimator.predict_proba(rows[selected])[:, 1], index=rows["DriverId"])
-             .reindex(entries["DriverId"]).to_numpy())
+    p_dnf = (
+        pd.Series(estimator.predict_proba(rows[selected])[:, 1], index=rows["DriverId"])
+        .reindex(entries["DriverId"])
+        .to_numpy()
+    )
 
     names = _latest_names(past_results)
-    drivers = entries.assign(Abbreviation=entries["DriverId"].map(names["Abbreviation"]),
-                             TeamName=entries["DriverId"].map(names["TeamName"]),
-                             points_so_far=0.0)
+    drivers = entries.assign(
+        Abbreviation=entries["DriverId"].map(names["Abbreviation"]),
+        TeamName=entries["DriverId"].map(names["TeamName"]),
+        points_so_far=0.0,
+    )
     setup = SeasonSetup(
-        year=year, through_round=round_number - 1, drivers=drivers,
+        year=year,
+        through_round=round_number - 1,
+        drivers=drivers,
         others=pd.DataFrame(columns=["DriverId", "points_so_far"]),
-        teams=pd.DataFrame({"TeamName": sorted(drivers["TeamName"].unique()),
-                            "points_so_far": 0.0}),
-        races=pd.DataFrame({"RoundNumber": [round_number], "EventName": [event_name],
-                            "RaceDate": [pd.Timestamp(race_date)], "has_sprint": [False]}),
-        strength=strength, alpha=alpha, p_dnf=p_dnf, p_dns=0.0,
+        teams=pd.DataFrame(
+            {"TeamName": sorted(drivers["TeamName"].unique()), "points_so_far": 0.0}
+        ),
+        races=pd.DataFrame(
+            {
+                "RoundNumber": [round_number],
+                "EventName": [event_name],
+                "RaceDate": [pd.Timestamp(race_date)],
+                "has_sprint": [False],
+            }
+        ),
+        strength=strength,
+        alpha=alpha,
+        p_dnf=p_dnf,
+        p_dns=0.0,
         team_index=np.zeros(len(drivers), dtype=int),
     )
     out = race_outlook(setup, n_samples=n_samples, seed=seed)
-    return out.assign(grid=out["Abbreviation"].map(
-        drivers.set_index("Abbreviation")["DriverId"].map(grid)))
+    return out.assign(
+        grid=out["Abbreviation"].map(
+            drivers.set_index("Abbreviation")["DriverId"].map(grid)
+        )
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -462,12 +579,13 @@ class SeasonDraws:
     """Final points in every trial."""
 
     setup: SeasonSetup
-    drivers: np.ndarray     # (trials, simulated drivers)
-    teams: np.ndarray       # (trials, teams)
+    drivers: np.ndarray  # (trials, simulated drivers)
+    teams: np.ndarray  # (trials, teams)
 
 
-def _fastest_lap_bonus(strength: np.ndarray, positions: np.ndarray,
-                       rng: np.random.Generator) -> np.ndarray:
+def _fastest_lap_bonus(
+    strength: np.ndarray, positions: np.ndarray, rng: np.random.Generator
+) -> np.ndarray:
     """One point to a top-ten finisher, drawn in proportion to strength.
 
     A modest model of a noisy award -- in practice it often went to whoever
@@ -555,19 +673,28 @@ def summarise(draws: SeasonDraws) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     columns = ["Abbreviation", "TeamName", "points_so_far"]
     fixed = setup.others["points_so_far"].to_numpy()
-    everyone = np.hstack([draws.drivers,
-                          np.broadcast_to(fixed, (len(draws.drivers), len(fixed)))])
-    base = pd.concat([setup.drivers[columns],
-                      setup.others.reindex(columns=columns).assign(TeamName=lambda d:
-                          d["TeamName"].fillna("") + " (no longer racing)")],
-                     ignore_index=True)
+    everyone = np.hstack(
+        [draws.drivers, np.broadcast_to(fixed, (len(draws.drivers), len(fixed)))]
+    )
+    base = pd.concat(
+        [
+            setup.drivers[columns],
+            setup.others.reindex(columns=columns).assign(
+                TeamName=lambda d: d["TeamName"].fillna("") + " (no longer racing)"
+            ),
+        ],
+        ignore_index=True,
+    )
     drivers = table(everyone, base)
     teams = table(draws.teams, setup.teams[["TeamName", "points_so_far"]])
     return drivers, teams
 
 
 def race_outlook(
-    setup: SeasonSetup, *, race: int = 0, n_samples: int = DEFAULT_TRIALS,
+    setup: SeasonSetup,
+    *,
+    race: int = 0,
+    n_samples: int = DEFAULT_TRIALS,
     seed: int = config.RANDOM_SEED,
 ) -> pd.DataFrame:
     """One upcoming race, per driver: the chances of each outcome that pays.
@@ -590,7 +717,9 @@ def race_outlook(
     frame = setup.drivers[["Abbreviation", "TeamName"]].copy()
     frame["p_win"] = (positions == 1).mean(axis=0)
     frame["p_podium"] = ((positions >= 1) & (positions <= 3)).mean(axis=0)
-    frame["p_points"] = ((positions >= 1) & (positions <= POINTS_POSITIONS)).mean(axis=0)
+    frame["p_points"] = ((positions >= 1) & (positions <= POINTS_POSITIONS)).mean(
+        axis=0
+    )
     frame["p_dnf"] = p_out
     frame["exp_points"] = table[positions].mean(axis=0)
     return frame.sort_values("exp_points", ascending=False, ignore_index=True)
@@ -624,15 +753,27 @@ def score_season(draws: SeasonDraws, results: pd.DataFrame) -> pd.DataFrame:
     season = results.loc[results["Year"] == setup.year]
     final_drivers = season.groupby("DriverId")["Points"].sum()
     final_teams = season.groupby("TeamName")["Points"].sum()
-    later = season.loc[(season["RoundNumber"] > setup.through_round)
-                       & (season["session_type"] == "R")]
+    later = season.loc[
+        (season["RoundNumber"] > setup.through_round) & (season["session_type"] == "R")
+    ]
     raced = later.groupby(["DriverId", "TeamName"])["RoundNumber"].nunique()
 
     rows = []
     entities = [
-        ("driver", setup.drivers["DriverId"], setup.drivers["TeamName"],
-         draws.drivers, final_drivers),
-        ("team", setup.teams["TeamName"], setup.teams["TeamName"], draws.teams, final_teams),
+        (
+            "driver",
+            setup.drivers["DriverId"],
+            setup.drivers["TeamName"],
+            draws.drivers,
+            final_drivers,
+        ),
+        (
+            "team",
+            setup.teams["TeamName"],
+            setup.teams["TeamName"],
+            draws.teams,
+            final_teams,
+        ),
     ]
     for kind, ids, teams, samples, finals in entities:
         champion = finals.idxmax()
@@ -640,18 +781,26 @@ def score_season(draws: SeasonDraws, results: pd.DataFrame) -> pd.DataFrame:
         for j, (entity, team) in enumerate(zip(ids, teams)):
             actual = float(finals.get(entity, 0.0))
             x = samples[:, j]
-            complete = (kind == "team" or
-                        raced.get((entity, team), 0) == len(setup.races))
-            rows.append({
-                "year": setup.year, "through_round": setup.through_round,
-                "kind": kind, "entity": entity, "complete": bool(complete),
-                "actual": actual, "mean": float(x.mean()),
-                "p10": float(np.percentile(x, 10)), "p90": float(np.percentile(x, 90)),
-                "pit": float((x < actual).mean() + 0.5 * (x == actual).mean()),
-                "crps": _crps(x, actual),
-                "p_champion": float(p_champ[j]),
-                "champion": entity == champion,
-            })
+            complete = kind == "team" or raced.get((entity, team), 0) == len(
+                setup.races
+            )
+            rows.append(
+                {
+                    "year": setup.year,
+                    "through_round": setup.through_round,
+                    "kind": kind,
+                    "entity": entity,
+                    "complete": bool(complete),
+                    "actual": actual,
+                    "mean": float(x.mean()),
+                    "p10": float(np.percentile(x, 10)),
+                    "p90": float(np.percentile(x, 90)),
+                    "pit": float((x < actual).mean() + 0.5 * (x == actual).mean()),
+                    "crps": _crps(x, actual),
+                    "p_champion": float(p_champ[j]),
+                    "champion": entity == champion,
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -660,16 +809,23 @@ def calibration_summary(scored: pd.DataFrame) -> pd.Series:
     s = scored.loc[scored["complete"]]
     inside = (s["actual"] >= s["p10"]) & (s["actual"] <= s["p90"])
     pit = s["pit"].to_numpy()
-    return pd.Series({
-        "entities": float(len(s)),
-        "coverage80": float(inside.mean()),
-        "below_p10": float((s["actual"] < s["p10"]).mean()),
-        "above_p90": float((s["actual"] > s["p90"]).mean()),
-        "pit_sd": float(pit.std()),          # 0.289 for a uniform PIT
-        "crps": float(s["crps"].mean()),
-        # One championship per (season, cutoff, kind): the Brier score of the
-        # whole title distribution, summed over entrants, then averaged.
-        "brier_champion": float(((s["p_champion"] - s["champion"]) ** 2)
-                                .groupby([s[c] for c in ("year", "through_round", "kind")
-                                          if c in s.columns]).sum().mean()),
-    })
+    return pd.Series(
+        {
+            "entities": float(len(s)),
+            "coverage80": float(inside.mean()),
+            "below_p10": float((s["actual"] < s["p10"]).mean()),
+            "above_p90": float((s["actual"] > s["p90"]).mean()),
+            "pit_sd": float(pit.std()),  # 0.289 for a uniform PIT
+            "crps": float(s["crps"].mean()),
+            # One championship per (season, cutoff, kind): the Brier score of the
+            # whole title distribution, summed over entrants, then averaged.
+            "brier_champion": float(
+                ((s["p_champion"] - s["champion"]) ** 2)
+                .groupby(
+                    [s[c] for c in ("year", "through_round", "kind") if c in s.columns]
+                )
+                .sum()
+                .mean()
+            ),
+        }
+    )

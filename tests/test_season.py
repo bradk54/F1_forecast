@@ -87,6 +87,22 @@ def test_zero_noise_means_no_offsets() -> None:
     np.testing.assert_allclose(offsets, 0.0)
 
 
+def test_teammates_share_a_walk_and_it_compounds() -> None:
+    """The point of the offsets: team-mates move together, and uncertainty grows."""
+    rng = np.random.default_rng(0)
+    team_index = np.array([0, 0, 1, 1, 2])   # drivers 0/1 and 2/3 are team-mates
+    offsets = season.draw_trial_offsets(
+        rng, 4000, 9, team_index, season.SeasonNoise(team_sd=0.2, driver_sd=0.0))
+
+    assert offsets.shape == (4000, 9, 5)
+    np.testing.assert_array_equal(offsets[:, :, 0], offsets[:, :, 1])
+    np.testing.assert_array_equal(offsets[:, :, 2], offsets[:, :, 3])
+    assert not np.allclose(offsets[:, :, 0], offsets[:, :, 2])
+    # A random walk: after k races the spread is sqrt(k) times one step's, so
+    # nine races is three times one.  A fixed shift would give a ratio of 1.
+    assert offsets[:, 8, 0].std() == pytest.approx(3 * offsets[:, 0, 0].std(), rel=0.1)
+
+
 def test_crps_of_a_point_mass_at_the_truth_is_zero() -> None:
     assert season._crps(np.full(100, 42.0), 42.0) == pytest.approx(0.0)
     assert season._crps(np.full(100, 42.0), 40.0) == pytest.approx(2.0)

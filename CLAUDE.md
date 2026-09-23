@@ -287,10 +287,17 @@ src/models/forecast.py        the CLI, and the measured choices as documented co
 - **Every choice was made on 2020–2023 and scored on 2024+.** Selection needs a
   paired t ≥ 2 over races *and* ≥ 0.02 nats. Greedy selection is path-dependent;
   break a tie by the fully tuned development score, never by the test table.
-- **The season simulation's races must be correlated.** Independent draws
-  around a frozen order covered 48% of constructors' outcomes in their nominal
-  80% intervals on 2024–25, and gave McLaren 0.0% for a 2024 title they won.
-  Tune `draw_trial_offsets` by `backtest` on 2021–23 and check on 2024–25.
+- **The season simulation's races must be correlated, and now are — at the team
+  level only.** Independent draws around a frozen order covered 48% of
+  constructors' outcomes in their nominal 80% intervals on 2024–25, and gave
+  McLaren 0.0% for a 2024 title they won. `draw_trial_offsets` now carries each
+  team's pace as a random walk shared by both cars; `DEFAULT_SEASON_NOISE`
+  (`team_sd=0.5`) was chosen by `backtest` on 2021–23 and checked on 2024–25,
+  where it lifted constructors' coverage 0.48 → 0.73 and drivers' 0.56 → 0.70.
+  That is still short of 0.80, and it is provisional: `driver_sd` is unused, so
+  team-mates cannot move apart, which is what constructors' totals need to
+  diversify. The calm 2021–23 seasons preferred 0.2–0.3; 0.5 was chosen for the
+  regime-shift seasons. Re-run `backtest` whenever either changes.
 - **Grid-based driver features carry penalties and long memories.** The data
   has no clean qualifying position, and the 24-race driver half-life reaches
   into a rookie season (Antonelli, 2025 vs 2026). Known and recorded; the fix
