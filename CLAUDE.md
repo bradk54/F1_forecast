@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Forecasting Formula 1 race outcomes. There are **two parallel codebases**, and knowing which one a task belongs to is the first thing to work out:
 
-1. **`src/` — the retirement (DNF) prediction pipeline.** A tested Python package, ~4,800 lines: ingest, labelling, feature engineering, and model evaluation. This is where pipeline work belongs.
-2. **`Notebooks/` — the points/finishing-position modelling.** Notebook-centric exploratory work on a separate track, with its own feature harness (see below). It does not import `src/`.
+1. **`src/` — the tested pipeline and both production models.** Ingest, labelling, feature engineering, the retirement (DNF) model, and the finishing-order / championship model built on top of it (see "The Finishing-Order and Championship Model" below). This is where pipeline and model work belongs.
+2. **`Notebooks/` — exploratory points/finishing-position work.** Notebook-centric, with its own feature harness (see below). It does not import `src/`, and it predates the `src/` finishing-order model.
 
 They share the `Data/raw` fastf1 cache and nothing else.
 
@@ -82,12 +82,11 @@ src/models/predict.py         the CLI: refresh, next, race, status
 failure modes, and why running before qualifying is a different model rather
 than a less confident one. Read it before changing anything in `src/models/`.
 
-**`References/points_model_design.md` is the design brief for what comes next** —
-the exact current model and its (untuned, hand-set) hyperparameters, the lessons
-the DNF work actually produced, how to approach feature creation for a
-finishing-position model, and how to build a probabilistic per-race and
-season-long forecast on top of it. Read it before starting the points model;
-it exists so that work does not repeat the mistakes catalogued in it.
+**`References/points_model_design.md` is the design brief the points model was
+built from** — the DNF model's exact form and untuned hyperparameters, and the
+lessons the DNF work produced. The model it describes now exists; see "The
+Finishing-Order and Championship Model" below, which uses this one as its
+attrition stage.
 
 Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Intermediates cache to `Data/processed/{race_results,circuit_profiles}.parquet`; the modelling table lands at `Data/processed/dnf_dataset.parquet`. `--skip-download` reuses those parquets; `--offline` rebuilds from the fastf1 cache without network.
 
@@ -224,6 +223,88 @@ Build it with `python -m src.data.generate_dataset --seasons 2018-2025`. Interme
 - **Exit codes:** 1 no data / unreachable, 2 missing cached intermediates,
   3 leakage, 4 a race with no finishing status, 5 a rebuild that lost races,
   6 a rebuild that lost circuit profiles.
+
+## The Finishing-Order and Championship Model (`src/`)
+
+Where each driver finishes, and who wins both titles. Attrition from the DNF
+model, then a **stagewise Plackett-Luce** over the cars that survive, then the
+season's points map, then a season simulation. **`References/points_model_guide.md`
+is the operating guide** — pipeline, features, assumptions, how to run and update
+it, and the maths. **`References/points_model_results.md` is the record** —
+hypotheses, protocol, every deciding number, and what failed. Read both before
+changing any of this.
+
+```
+src/data/teams.py             constructor lineage across rebrands (TeamId changes at every one)
+src/features/order_features.py  finishing-order features, built at fit time; detect_order_leakage
+src/models/ranking.py         stagewise Plackett-Luce: likelihood, gradient, exact sampler
+src/models/order_eval.py      race-by-race walk-forward for orders; composite scoring; DEV/TEST dates
+src/models/tuning.py          forward selection, pruning, coordinate search, the protocol
+src/models/boosted_ranker.py  gradient-boosted ranking with a PL head -- the comparison family
+src/models/points_table.py    points rules by season (fastest lap 2019-2024, sprint maps)
+src/models/season.py          championship simulation, single-race outlook, season backtest
+src/models/forecast.py        the CLI, and the measured choices as documented constants
+```
+
+```bash
+./.venv/bin/python -m src.models.forecast next       # the next race, per driver
+./.venv/bin/python -m src.models.forecast next --stage post_quali   # Saturday (1 API call)
+./.venv/bin/python -m src.models.forecast race 2026 14   # backtest one completed race
+./.venv/bin/python -m src.models.forecast season     # both championships, simulated
+./.venv/bin/python -m src.models.forecast evaluate   # held-out scores, 2024 onward
+./.venv/bin/python -m src.models.forecast backtest   # season-sim calibration
+./.venv/bin/python -m src.models.forecast tune       # re-run selection and tuning (each winter)
+```
+
+### Rules that hold for this model
+
+- **A race result is a permutation; model the order.** Twenty per-driver
+  position models give two winners and cannot roll up into a championship.
+- **Plackett-Luce needs a scale per finishing position.** The front of a grand
+  prix is far more predictable than the midfield: fitted freely, the scale is
+  1.00 for the winner, 0.64 for second, 0.19 for tenth. Standard PL has one
+  scale, so it was underconfident about winners (calibration slope 2.83) and no
+  training truncation could fix every tier at once. `n_scales=10` took the
+  held-out slopes to 0.81 / 0.95 / 1.05 (win / podium / points). `log(grid)` is
+  not a substitute — it gets ~0 weight once the scales are free.
+- **Score expected points with squared error, never absolute error.** MAE is
+  minimised by the median and a points distribution is mostly zeros, so
+  deterministic grid order "won" on MAE while losing every proper score.
+- **Anything constant within a race cancels in Plackett-Luce.** Circuit,
+  weather and calendar features act only through interactions with a
+  driver-varying feature. The one circuit interaction tested
+  (`grid_x_circuit_retention`) hurt: −0.13 nats a race.
+- **Team history follows the organisation, not the name.** The running order
+  carries across the winter (season-mean r = 0.79–0.95, including 2022 and
+  2026); `TeamId`-keyed history throws that away at every rebrand. Key new
+  team features on `team_lineage`.
+- **Retirements stay out of the ranking; the DNF model supplies them.** Ranking
+  them last inside PL is significantly worse (held-out RPS +0.0016, CI
+  [+0.0009, +0.0024]). The DNF model's *per-car* differentiation adds little —
+  better P(points) calibration after qualifying, nothing before — so its real
+  job here is the calibrated attrition level. A strength is **pace conditional
+  on finishing**: never publish a driver ranking from the coefficients alone.
+- **Every choice was made on 2020–2023 and scored on 2024+.** Selection needs a
+  paired t ≥ 2 over races *and* ≥ 0.02 nats. Greedy selection is path-dependent;
+  break a tie by the fully tuned development score, never by the test table.
+- **The season simulation's races must be correlated, and now are — at the team
+  level only.** Independent draws around a frozen order covered 48% of
+  constructors' outcomes in their nominal 80% intervals on 2024–25, and gave
+  McLaren 0.0% for a 2024 title they won. `draw_trial_offsets` now carries each
+  team's pace as a random walk shared by both cars; `DEFAULT_SEASON_NOISE`
+  (`team_sd=0.5`) was chosen by `backtest` on 2021–23 and checked on 2024–25,
+  where it lifted constructors' coverage 0.48 → 0.73 and drivers' 0.56 → 0.70.
+  That is still short of 0.80, and it is provisional: `driver_sd` is unused, so
+  team-mates cannot move apart, which is what constructors' totals need to
+  diversify. The calm 2021–23 seasons preferred 0.2–0.3; 0.5 was chosen for the
+  regime-shift seasons. Re-run `backtest` whenever either changes.
+- **Grid-based driver features carry penalties and long memories.** The data
+  has no clean qualifying position, and the 24-race driver half-life reaches
+  into a rookie season (Antonelli, 2025 vs 2026). Known and recorded; the fix
+  is qualifying results — ~186 loads, so budget them.
+- **The boosted ranker is the comparison, not the model.** With its own search
+  its best setting was the most constrained one, and it ties PL on held-out RPS
+  while losing on log-likelihood.
 
 ## Conventions
 
