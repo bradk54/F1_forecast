@@ -1,11 +1,37 @@
 f1-forecast-engine
 ==================
 
-Forecasting Formula 1 outcomes. Two models live here:
+Forecasting Formula 1 outcomes. Two models live in `src/`, one built on the other:
 
-- **Points** (`Notebooks/2_0_Model_Development.ipynb`) — how many points will a driver score?
-  Design brief for the rebuild: `References/points_model_design.md`.
-- **Retirement** (`Notebooks/3_0_DNF_Dataset.ipynb`) — will a driver finish the race at all?
+- **Retirement** (`src/models/predict.py`) — will a driver finish the race at all?
+- **Finishing order and championships** (`src/models/forecast.py`) — where will each
+  driver finish, and who wins the drivers' and constructors' titles? Attrition from the
+  retirement model, then a stagewise Plackett-Luce over the cars that survive, then a
+  season simulation. How it works and how to run it: `References/points_model_guide.md`;
+  the evidence behind every choice: `References/points_model_results.md`.
+
+The notebooks (`Notebooks/2_0_Model_Development.ipynb` for points, `3_0_DNF_Dataset` for
+retirement) are the exploratory work both grew out of.
+
+---
+
+## Finishing order and championships
+
+```bash
+./.venv/bin/python -m src.models.forecast next       # the next race, per driver
+./.venv/bin/python -m src.models.forecast next --stage post_quali   # after qualifying
+./.venv/bin/python -m src.models.forecast race 2026 14   # backtest one race
+./.venv/bin/python -m src.models.forecast season     # both championships, simulated
+./.venv/bin/python -m src.models.forecast evaluate   # held-out scores, 2024 onward
+./.venv/bin/python -m src.models.forecast backtest   # season-sim calibration
+./.venv/bin/python -m src.models.forecast tune       # re-run selection and tuning
+```
+
+A race result is a permutation, so the model predicts a distribution over whole finishing
+orders rather than twenty separate positions. Every choice was made on 2020-2023 races and
+scored once on 2024 onward. `References/points_model_guide.md` explains the pipeline, the
+features, the assumptions and the maths; `References/points_model_results.md` has the
+hypotheses, the tables, and what did not work.
 
 ---
 
@@ -148,14 +174,24 @@ independent.
 |  |- data
 |  |  |- ingest.py          <- FastF1 loading; the only module that hits the network
 |  |  |- circuits.py        <- curated circuit reference (street / night / altitude)
+|  |  |- teams.py           <- constructor lineage across rebrands
 |  |  |- generate_dataset.py<- CLI orchestrator
 |  |- features
 |  |  |- labels.py          <- classification codes -> modelling targets
 |  |  |- track_profile.py   <- telemetry -> circuit geometry and speed character
 |  |  |- build_features.py  <- leakage-safe rolling history
+|  |  |- order_features.py  <- finishing-order features, built at fit time
 |  |  |- registry.py        <- feature catalogue with stage tags
 |  |- models
-|     |- train.py           <- baselines, walk-forward evaluation, ablation
+|     |- train.py           <- DNF baselines, walk-forward evaluation, ablation
+|     |- predict.py         <- DNF CLI: refresh, next, race, status
+|     |- ranking.py         <- stagewise Plackett-Luce: likelihood, fit, exact sampler
+|     |- order_eval.py      <- race-by-race walk-forward for orders; composite scoring
+|     |- tuning.py          <- feature selection and hyperparameter search
+|     |- boosted_ranker.py  <- gradient-boosted ranking, the comparison family
+|     |- points_table.py    <- points rules by season
+|     |- season.py          <- championship simulation and its backtest
+|     |- forecast.py        <- finishing-order CLI
 |
 |- tests
    |- synthetic.py          <- FastF1-shaped fixtures; no network needed
@@ -167,7 +203,7 @@ independent.
 pytest -q
 ```
 
-125 tests, none of which touch the network. The F1 APIs are rate-limited everywhere and
+About 375 tests, none of which touch the network. The F1 APIs are rate-limited everywhere and
 blocked outright on some networks, so the pipeline is validated against generated data whose
 schema matches FastF1's. `tests/synthetic.py` builds circuits from segment lists and Fourier
 series and runs a quasi-steady-state lap simulation over them, which means the geometry has

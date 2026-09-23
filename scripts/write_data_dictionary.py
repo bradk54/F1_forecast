@@ -47,6 +47,13 @@ def render() -> str:
     w("   outcome applied to a car that usually completed the race. `dnf_cause` still records")
     w("   it, so the rows stay findable.\n")
 
+    w("\n## Where a feature lives\n")
+    w("Most features are written to `Data/processed/dnf_dataset.parquet` by the dataset")
+    w("build (**dataset** below).  The finishing-order features are built **at fit time** by")
+    w("`src/features/order_features.py`, because their half-lives are hyperparameters the")
+    w("tuning searches and a stored column would freeze them.  Both are registered here,")
+    w("because the stage tag is what stops a Saturday column reaching a Monday model.\n")
+
     w("\n## Feature stages\n")
     w("Each feature is tagged with when it becomes knowable. A model may use its own stage")
     w("and every earlier one.\n")
@@ -63,10 +70,11 @@ def render() -> str:
     for stage in registry.STAGE_ORDER:
         block = frame.loc[frame["stage"] == stage]
         w(f"\n## `{stage}` features ({len(block)})\n")
-        w("| feature | kind | description |")
-        w("| --- | --- | --- |")
+        w("| feature | kind | built | description |")
+        w("| --- | --- | --- | --- |")
         for _, row in block.iterrows():
-            w(f"| `{row['feature']}` | {row['kind']} | {row['description']} |")
+            built = "dataset" if row["table"] == "dnf_dataset" else "at fit time"
+            w(f"| `{row['feature']}` | {row['kind']} | {built} | {row['description']} |")
 
     w("\n## Leakage guarantee\n")
     w("Every history feature is built by shifting within its entity before aggregating, so")
@@ -76,6 +84,12 @@ def render() -> str:
     w("that event. The dataset build runs it and refuses to write if anything is found.\n")
     w("The detector is itself tested against deliberately planted leaks — a `cumsum` with no")
     w("shift, and a same-race team aggregate — so a silent pass means something.\n")
+    w("Flipping `dnf` cannot catch a feature built from finishing *position*, so the")
+    w("order features have their own check, `src.features.order_features.detect_order_leakage`,")
+    w("which runs two corruptions of one race.  Reversing the finishing order may move no")
+    w("feature at or before that race.  Reversing the grid may move no `pre_weekend` feature")
+    w("at or before it, and a `post_quali` feature only within that race, since the grid is")
+    w("known by then.  It is tested against a planted leak too.\n")
 
     return "\n".join(lines) + "\n"
 

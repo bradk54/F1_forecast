@@ -452,3 +452,71 @@ def make_race_results(
                     }
                 )
     return pd.DataFrame(rows)
+
+
+def make_order_results(
+    *,
+    seasons: tuple[int, ...] = (2021, 2022, 2023),
+    races_per_season: int = 12,
+    n_teams: int = 6,
+    n_circuits: int = 4,
+    dnf_rate: float = 0.08,
+    rebrand: tuple[str, str, int] | None = None,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Race results whose finishing order is drawn from a known Plackett-Luce.
+
+    :func:`make_race_results` fixes the finishing order by driver index, which
+    is fine for retirement features and useless for an ordering model.  Here
+    each team has a latent pace and each driver a latent skill; the grid is a
+    noisy sort of their sum, and the finishing order among survivors is a
+    Plackett-Luce draw on ``pace + skill`` plus a grid effect.  Classified
+    positions are compacted over the survivors, as a real classification is.
+    The truth travels in ``_true_*`` columns.
+
+    Args:
+        rebrand: ``(old_id, new_id, first_year)`` renames one team's
+            ``TeamId`` from ``first_year`` on -- the shape of Renault becoming
+            Alpine -- to exercise lineage-keyed history.
+    """
+    rng = np.random.default_rng(seed)
+    team_ids = [f"team_{i:02d}" for i in range(n_teams)]
+    pace = np.linspace(2.0, -2.0, n_teams)
+    drivers = [f"driver_{i:02d}" for i in range(2 * n_teams)]
+    skill = rng.normal(0.0, 0.4, size=len(drivers))
+    rows = []
+    for year in seasons:
+        for rnd in range(1, races_per_season + 1):
+            date = pd.Timestamp(f"{year}-03-01") + pd.Timedelta(days=14 * rnd)
+            ci = (rnd - 1) % n_circuits
+            latent = np.array([pace[i // 2] + skill[i] for i in range(len(drivers))])
+            grid = np.argsort(np.argsort(-(latent + rng.normal(0, 0.5, len(drivers))))) + 1
+            strength = latent - 0.08 * grid
+            retired = rng.random(len(drivers)) < dnf_rate
+            noisy = np.where(retired, -np.inf, strength + rng.gumbel(size=len(drivers)))
+            order = np.argsort(-noisy)
+            finish = np.empty(len(drivers))
+            finish[order] = np.arange(1, len(drivers) + 1)
+            for i, driver in enumerate(drivers):
+                team = team_ids[i // 2]
+                if rebrand and team == rebrand[0] and year >= rebrand[2]:
+                    team = rebrand[1]
+                pos = np.nan if retired[i] else finish[i]
+                rows.append({
+                    "Year": year, "RoundNumber": rnd, "RaceDate": date,
+                    "EventName": f"Circuit {100 + ci} Grand Prix",
+                    "circuit_key": 100 + ci,
+                    "DriverId": driver, "Abbreviation": f"D{i:02d}",
+                    "TeamId": team, "TeamName": team.replace("_", " ").title(),
+                    "GridPosition": float(grid[i]),
+                    "Position": finish[i],
+                    "ClassifiedPosition": "R" if retired[i] else str(int(pos)),
+                    "Status": "Retired" if retired[i] else "Finished",
+                    "Points": 0.0 if retired[i] else float(
+                        dict(enumerate((25, 18, 15, 12, 10, 8, 6, 4, 2, 1), 1)).get(int(pos), 0)),
+                    "Laps": 20.0 if retired[i] else 57.0,
+                    "session_type": "R",
+                    "_true_team_pace": pace[i // 2],
+                    "_true_driver_skill": skill[i],
+                })
+    return pd.DataFrame(rows)
