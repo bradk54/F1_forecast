@@ -110,7 +110,9 @@ def sidebar_status(dataset: pd.DataFrame, manifest) -> None:
                 "Model", services.MODELS,
                 index=services.MODELS.index(manifest.model)
                 if manifest and manifest.model in services.MODELS
-                else services.MODELS.index("random_forest"),
+                # With nothing fitted, offer what the CLI fits: the measured
+                # best, not a model that calibrates at 0.61 against 0.92.
+                else services.MODELS.index(services.DEFAULT_MODEL),
                 key="refit_model",
             )
             lookback = st.number_input(

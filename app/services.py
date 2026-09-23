@@ -36,6 +36,7 @@ from src import config
 from src.features import registry
 from src.features.build_features import ORDER_COL
 from src.models import forecast, monitor, season, store
+from src.models.predict import DEFAULT_MODEL
 from src.models.train import (
     DEFAULT_LOOKBACK_RACES,
     MODEL_FACTORIES,
@@ -664,7 +665,7 @@ def season_calibration() -> tuple[pd.DataFrame, list[int]] | None:
 
 __all__ = [
     "Artefacts", "HIGHER_IS_BETTER", "MODELS", "STAGES", "TARGET",
-    "ORDER_COL", "DEFAULT_LOOKBACK_RACES",
+    "ORDER_COL", "DEFAULT_LOOKBACK_RACES", "DEFAULT_MODEL",
     "artefacts", "bootstrap_interval", "cached_ablation", "cached_backtest_race",
     "cached_championship", "cached_post_quali", "cached_pre_weekend",
     "cached_season_setup", "forecast_position", "forecast_ready",
