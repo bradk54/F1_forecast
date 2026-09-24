@@ -243,13 +243,21 @@ def format_odds(p: float) -> str:
     Printing 99.94% as ``99.9%`` or 0.03% as ``0.0%`` claims a resolution the
     model has not earned.
 
-    Used for every odds column on the page, so one rule decides them all.
+    So the tails are capped: below 1% prints ``<1%`` and above 99% prints
+    ``>99%``, and everything between keeps one decimal.  Used for every odds
+    column on the Forecast and Race weekend pages, so one rule decides them all.
+
+    Exact 0 and 1 are capped too.  A share of simulated trials cannot tell "no
+    path to the title" from "a path too rare to turn up in 10,000 draws", and
+    ``<1%`` is true of both where ``0.0%`` is true only of the first.
     """
-    # Open decision: this is plain one-decimal formatting for now.  Candidates
-    # are capping the tails (``<1%`` / ``>99%``), whole percentages, or "1 in N"
-    # odds; whichever is chosen, a true zero (no path to the title) should
-    # probably still print as zero.
-    return fmt_pct(p)
+    if pd.isna(p):
+        return "—"
+    if p < 0.01:
+        return "<1%"
+    if p > 0.99:
+        return ">99%"
+    return f"{p:.1%}"
 
 
 def outlook_table(outlook: pd.DataFrame) -> None:

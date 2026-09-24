@@ -185,11 +185,13 @@ with tab_title:
             ])
             st.caption(
                 f"Backtested on {', '.join(map(str, seasons))}, forecast from "
-                "part-way through each season, at the shipped setting. Both fall short of 80%, so **the bands above "
-                "are too narrow and the extreme odds too confident.** "
-                "Constructors are the weaker of the two: team-mates share one "
-                "pace drift, so nothing diversifies a team's total. Treat 99% "
-                "as 'very likely', not as 99%."
+                "part-way through each season, at the shipped setting. Both "
+                "fall short of 80%, so **the bands above are too narrow and "
+                "the extreme odds too confident.** Constructors are the weaker "
+                "of the two: team-mates share one pace drift, so nothing "
+                "diversifies a team's total. That is why odds beyond 1% and "
+                "99% print as `<1%` and `>99%`: read them as 'very unlikely' "
+                "and 'very likely', not as a number."
             )
 
 # --------------------------------------------------------------------------- #
