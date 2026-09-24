@@ -251,3 +251,37 @@ def format_odds(p: float) -> str:
     # probably still print as zero.
     return fmt_pct(p)
 
+
+def outlook_table(outlook: pd.DataFrame) -> None:
+    """A race forecast per driver, as ``src.models.forecast`` returns it.
+
+    One renderer for every page that shows one, so "P(out)" and "exp pts" mean
+    the same column wherever they appear.  ``grid`` and ``finished`` are shown
+    when the frame carries them: a post-qualifying forecast has a grid, and a
+    backtest has the result beside it.
+    """
+    view = outlook.copy()
+    columns = ["Abbreviation", "TeamName"]
+    if "grid" in view.columns:
+        view["grid"] = view["grid"].astype("Int64")
+        columns.append("grid")
+    columns += ["p_win", "p_podium", "p_points", "p_dnf", "exp_points"]
+    if "finished" in view.columns:
+        view["finished"] = view["finished"].astype("Int64")
+        columns.append("finished")
+    st.dataframe(
+        view[columns].rename(columns={
+            "Abbreviation": "driver", "TeamName": "team", "p_win": "P(win)",
+            "p_podium": "P(podium)", "p_points": "P(points)", "p_dnf": "P(out)",
+            "exp_points": "exp pts", "finished": "result",
+        }),
+        hide_index=True, width="stretch", height=max(360, 30 * len(view)),
+        column_config={
+            **{c: st.column_config.ProgressColumn(
+                c, format="%.3f", min_value=0.0, max_value=1.0)
+               for c in ("P(win)", "P(podium)", "P(points)")},
+            "P(out)": st.column_config.NumberColumn(format="%.3f"),
+            "exp pts": st.column_config.NumberColumn(format="%.2f"),
+        },
+    )
+

@@ -16,6 +16,13 @@ feature, and a missing grid is imputed to the back of the field — which inflat
 every prediction into something that looks like an opinion rather than an
 absence of information.  So a ``post_quali`` run without a grid is refused here
 exactly as it is in the CLI, and the escape hatch is labelled for what it does.
+
+Above the ranking sits the **finishing order** from ``src.models.forecast`` --
+the model this one feeds, and where most of the points are decided.  It has no
+saved artefact, so it is never in-sample and never stale, it takes its stage
+from the race rather than the sidebar, and it runs before any of the guards
+below: none of them apply to it, and a refused retirement ranking should not
+take the forecast down with it.
 """
 
 from __future__ import annotations
@@ -31,9 +38,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app import charts, services  # noqa: E402
 from app.common import (  # noqa: E402
-    fmt_pct, metric_row, page_setup, require_dataset, sidebar_status,
+    fmt_pct, format_odds, metric_row, outlook_table, page_setup,
+    require_dataset, sidebar_status,
 )
-from src.models import monitor, store  # noqa: E402
+from src.models import monitor, season, store  # noqa: E402
 from src.models.predict import (  # noqa: E402
     build_inference_rows, entry_list, next_event, qualifying_grid,
 )
@@ -50,20 +58,14 @@ sidebar_status(dataset, manifest)
 
 st.title("Race weekend")
 
-if manifest is None:
-    st.error("No model has been fitted. Use **Refit and save** in the sidebar.")
-    st.stop()
 if not services.artefacts().results:
     st.error("No raw results on disk; an upcoming race cannot be assembled.")
     st.stop()
 
-stage = manifest.stage
-st.caption(
-    f"Using the saved **{manifest.model}** model at stage **`{stage}`**, trained "
-    f"through {manifest.trained_through_year} R{manifest.trained_through_round}. "
-    "Change the stage by refitting in the sidebar — a stage is a different "
-    "model, not a setting."
-)
+# The saved retirement model's stage decides whether a completed race's grid
+# is passed to it.  The forecast below needs no saved model at all, so its
+# absence is reported where the retirement ranking would be, not here.
+stage = manifest.stage if manifest is not None else None
 
 # --------------------------------------------------------------------------- #
 # Pick a race
@@ -119,17 +121,125 @@ else:
             f"{event['year']} R{event['round_number']} {event['event_name']} — "
             f"{pd.Timestamp(event['race_date']).date()}"
         )
-        if stage == "post_quali":
-            fetch = st.checkbox(
-                "Fetch the grid from qualifying (uses the network)", value=False
-            )
-            if fetch:
-                with st.spinner("Loading qualifying ..."):
-                    grid = qualifying_grid(event["year"], event["round_number"])
-                grid_source = "qualifying" if grid else "qualifying (not available)"
+        fetch = st.checkbox(
+            "Fetch the grid from qualifying (uses the network)", value=False
+        )
+        if fetch:
+            with st.spinner("Loading qualifying ..."):
+                grid = qualifying_grid(event["year"], event["round_number"])
+            grid_source = "qualifying" if grid else "qualifying (not available)"
 
 if event is None:
     st.stop()
+
+results, profiles = services.load_raw(version)
+already_run = bool((
+    (results["Year"] == event["year"])
+    & (results["RoundNumber"] == event["round_number"])
+).any())
+
+# --------------------------------------------------------------------------- #
+# Finishing order
+# --------------------------------------------------------------------------- #
+#
+# The model the retirement model feeds.  It needs nothing saved -- it refits
+# from the parquets -- so it runs whatever the sidebar model's stage is, and it
+# picks its own stage from what the race has: a completed race is forecast from
+# its real grid by a fit on the races before it, an upcoming one from the
+# qualifying grid when fetched and from the pre-weekend model when not.  The
+# pre-weekend model is fitted without a grid at all, so unlike the retirement
+# model above it needs no escape hatch for a missing one.
+
+st.subheader("Finishing order")
+
+fc_version = services.forecast_version()
+outlook = None
+try:
+    if already_run:
+        outlook = services.cached_backtest_race(
+            fc_version, year=event["year"], round_number=event["round_number"],
+            trials=season.DEFAULT_TRIALS,
+        )
+        fc_source = (
+            "the post-qualifying model on the real grid, fitted **only on the "
+            "races before this one** -- out-of-sample even where the ranking "
+            "below is not"
+        )
+    elif grid is not None:
+        outlook = services.cached_post_quali(
+            fc_version,
+            event=(event["year"], event["round_number"], event["event_name"],
+                   pd.Timestamp(event["race_date"])),
+            grid=tuple(sorted(grid.items())), trials=season.DEFAULT_TRIALS,
+        )
+        fc_source = (
+            "the post-qualifying model on the qualifying grid (penalties not "
+            "yet applied)"
+        )
+    else:
+        fc_year, fc_through = services.forecast_position(fc_version)
+        outlook, upcoming = services.cached_pre_weekend(
+            fc_version, year=fc_year, through_round=fc_through,
+            trials=season.DEFAULT_TRIALS,
+        )
+        fc_source = (
+            "the **pre-weekend** model, fitted without a grid -- a prior, not a "
+            "forecast. Fetch the grid after qualifying for the sharper one"
+        )
+        if (upcoming["year"], upcoming["round_number"]) != (
+            event["year"], event["round_number"]
+        ):
+            st.warning(
+                f"The forecast's next race is {upcoming['year']} "
+                f"R{upcoming['round_number']}, not this one; showing nothing "
+                "rather than the wrong race."
+            )
+            outlook = None
+except Exception as exc:  # noqa: BLE001 - a fit failure is the answer here
+    st.error(f"Could not forecast the finishing order for this race: {exc}")
+
+if outlook is not None:
+    st.caption(f"From {fc_source}. Same numbers as the **Forecast** page.")
+    favourite = outlook.sort_values("p_win").iloc[-1]
+    items = [
+        ("Favourite", str(favourite["Abbreviation"]),
+         f"{format_odds(favourite['p_win'])} to win"),
+        ("Most expected points", str(outlook.iloc[0]["Abbreviation"]),
+         f"{outlook.iloc[0]['exp_points']:.1f} points"),
+    ]
+    if "finished" in outlook.columns:
+        winner = outlook.loc[outlook["finished"] == 1]
+        if len(winner):
+            items.append(("Winner", str(winner.iloc[0]["Abbreviation"]),
+                          f"forecast {format_odds(winner.iloc[0]['p_win'])}"))
+    metric_row(items)
+    outlook_table(outlook)
+    st.caption(
+        "P(out) here comes from the retirement model refitted on the races "
+        "before this one, so it can differ from the P(dnf) ranking below, "
+        "which is the saved model. Expected points is roughly P(finish) x the "
+        "points the finishing order would earn."
+        + (" `result` is the classified position; blank did not finish."
+           if "finished" in outlook.columns else "")
+    )
+
+# --------------------------------------------------------------------------- #
+# Retirement risk
+# --------------------------------------------------------------------------- #
+
+st.divider()
+st.subheader("Retirement risk")
+
+if manifest is None:
+    st.error("No model has been fitted. Use **Refit and save** in the sidebar.")
+    st.stop()
+
+st.caption(
+    f"Using the saved **{manifest.model}** model at stage **`{stage}`**, trained "
+    f"through {manifest.trained_through_year} R{manifest.trained_through_round}. "
+    "Change the stage by refitting in the sidebar — a stage is a different "
+    "model, not a setting."
+)
 
 # --------------------------------------------------------------------------- #
 # The post_quali guard
@@ -158,7 +268,6 @@ if stage == "post_quali" and grid is None:
 # Predict
 # --------------------------------------------------------------------------- #
 
-results, profiles = services.load_raw(version)
 estimator, loaded = services.load_model_unchecked(version)
 
 try:
@@ -182,10 +291,6 @@ if missing:
 
 rows["predicted"] = estimator.predict_proba(rows[loaded.features])[:, 1]
 
-already_run = (
-    (results["Year"] == event["year"])
-    & (results["RoundNumber"] == event["round_number"])
-).any()
 in_sample = already_run and (event["year"], event["round_number"]) <= (
     manifest.trained_through_year, manifest.trained_through_round
 )
@@ -204,7 +309,10 @@ elif already_run:
 
 ranked = rows.sort_values("predicted", ascending=False).reset_index(drop=True)
 ranked.insert(0, "rank", ranked.index + 1)
-show_grid = grid is not None
+# A fetched grid feeds the forecast whatever the saved stage, but only a
+# post_quali retirement model actually uses it -- showing grid beside a
+# pre_weekend ranking would imply an effect the model does not have.
+show_grid = grid is not None and stage == "post_quali"
 
 metric_row(
     [
@@ -349,7 +457,8 @@ if already_run:
 if not already_run:
     st.divider()
     st.caption(
-        "Saving a pending prediction is what makes the next `refresh` able to "
+        "Saving the retirement ranking as a pending prediction is what makes "
+        "the next `refresh` able to "
         "score it. The log entry it produces is a **live** row — the only kind "
         "that proves the weekly loop works."
     )

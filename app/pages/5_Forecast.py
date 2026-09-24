@@ -28,7 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app import charts, services  # noqa: E402
 from app.common import (  # noqa: E402
-    fmt_pct, format_odds, metric_row, page_setup, require_dataset,
+    fmt_pct, format_odds, metric_row, outlook_table, page_setup,
+    require_dataset,
 )
 from src.models import forecast, season  # noqa: E402
 
@@ -271,26 +272,7 @@ with tab_next:
         )
         charts.show(fig)
     with right:
-        cols = ["Abbreviation", "TeamName"]
-        if "grid" in view.columns:
-            view["grid"] = view["grid"].astype("Int64")
-            cols.append("grid")
-        cols += ["p_win", "p_podium", "p_points", "p_dnf", "exp_points"]
-        st.dataframe(
-            view[cols].rename(columns={
-                "Abbreviation": "driver", "TeamName": "team", "p_win": "P(win)",
-                "p_podium": "P(podium)", "p_points": "P(points)", "p_dnf": "P(out)",
-                "exp_points": "exp pts",
-            }),
-            hide_index=True, width="stretch", height=max(360, 26 * len(view)),
-            column_config={
-                **{c: st.column_config.ProgressColumn(
-                    c, format="%.3f", min_value=0.0, max_value=1.0)
-                   for c in ("P(win)", "P(podium)", "P(points)")},
-                "P(out)": st.column_config.NumberColumn(format="%.3f"),
-                "exp pts": st.column_config.NumberColumn(format="%.2f"),
-            },
-        )
+        outlook_table(view)
     st.caption(
         "P(out) is the chance of not finishing *or* not starting, from the "
         "retirement model. A retired car scores nothing, so expected points is "
@@ -338,25 +320,7 @@ with tab_back:
          "what the model gave the three who made it"),
     ])
 
-    view = result.copy()
-    view["grid"] = view["grid"].astype("Int64")
-    view["finished"] = view["finished"].astype("Int64")
-    st.dataframe(
-        view[["Abbreviation", "TeamName", "grid", "p_win", "p_podium", "p_points",
-              "p_dnf", "exp_points", "finished"]].rename(columns={
-            "Abbreviation": "driver", "TeamName": "team", "p_win": "P(win)",
-            "p_podium": "P(podium)", "p_points": "P(points)", "p_dnf": "P(out)",
-            "exp_points": "exp pts", "finished": "result",
-        }),
-        hide_index=True, width="stretch", height=max(360, 30 * len(view)),
-        column_config={
-            **{c: st.column_config.ProgressColumn(
-                c, format="%.3f", min_value=0.0, max_value=1.0)
-               for c in ("P(win)", "P(podium)", "P(points)")},
-            "P(out)": st.column_config.NumberColumn(format="%.3f"),
-            "exp pts": st.column_config.NumberColumn(format="%.2f"),
-        },
-    )
+    outlook_table(result)
     st.caption(
         "`result` is the classified position; blank means the car did not "
         "finish. One race is twenty rows of noise: read this view for whether "
