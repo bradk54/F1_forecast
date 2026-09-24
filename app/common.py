@@ -110,7 +110,9 @@ def sidebar_status(dataset: pd.DataFrame, manifest) -> None:
                 "Model", services.MODELS,
                 index=services.MODELS.index(manifest.model)
                 if manifest and manifest.model in services.MODELS
-                else services.MODELS.index("random_forest"),
+                # With nothing fitted, offer what the CLI fits: the measured
+                # best, not a model that calibrates at 0.61 against 0.92.
+                else services.MODELS.index(services.DEFAULT_MODEL),
                 key="refit_model",
             )
             lookback = st.number_input(
@@ -229,3 +231,65 @@ def fmt_pct(value: float) -> str:
 
 def fmt_num(value: float, places: int = 3) -> str:
     return "—" if pd.isna(value) else f"{value:.{places}f}"
+
+
+def format_odds(p: float) -> str:
+    """How a championship or podium probability is printed.
+
+    This is a judgement about false precision, and the data for it is on the
+    Forecast page: the season simulation's 80% intervals held the true total
+    only 70% (drivers) and 73% (constructors) of the time in the 2024-25
+    backtest, so its extreme odds are *more confident than the evidence*.
+    Printing 99.94% as ``99.9%`` or 0.03% as ``0.0%`` claims a resolution the
+    model has not earned.
+
+    So the tails are capped: below 1% prints ``<1%`` and above 99% prints
+    ``>99%``, and everything between keeps one decimal.  Used for every odds
+    column on the Forecast and Race weekend pages, so one rule decides them all.
+
+    Exact 0 and 1 are capped too.  A share of simulated trials cannot tell "no
+    path to the title" from "a path too rare to turn up in 10,000 draws", and
+    ``<1%`` is true of both where ``0.0%`` is true only of the first.
+    """
+    if pd.isna(p):
+        return "—"
+    if p < 0.01:
+        return "<1%"
+    if p > 0.99:
+        return ">99%"
+    return f"{p:.1%}"
+
+
+def outlook_table(outlook: pd.DataFrame) -> None:
+    """A race forecast per driver, as ``src.models.forecast`` returns it.
+
+    One renderer for every page that shows one, so "P(out)" and "exp pts" mean
+    the same column wherever they appear.  ``grid`` and ``finished`` are shown
+    when the frame carries them: a post-qualifying forecast has a grid, and a
+    backtest has the result beside it.
+    """
+    view = outlook.copy()
+    columns = ["Abbreviation", "TeamName"]
+    if "grid" in view.columns:
+        view["grid"] = view["grid"].astype("Int64")
+        columns.append("grid")
+    columns += ["p_win", "p_podium", "p_points", "p_dnf", "exp_points"]
+    if "finished" in view.columns:
+        view["finished"] = view["finished"].astype("Int64")
+        columns.append("finished")
+    st.dataframe(
+        view[columns].rename(columns={
+            "Abbreviation": "driver", "TeamName": "team", "p_win": "P(win)",
+            "p_podium": "P(podium)", "p_points": "P(points)", "p_dnf": "P(out)",
+            "exp_points": "exp pts", "finished": "result",
+        }),
+        hide_index=True, width="stretch", height=max(360, 30 * len(view)),
+        column_config={
+            **{c: st.column_config.ProgressColumn(
+                c, format="%.3f", min_value=0.0, max_value=1.0)
+               for c in ("P(win)", "P(podium)", "P(points)")},
+            "P(out)": st.column_config.NumberColumn(format="%.3f"),
+            "exp pts": st.column_config.NumberColumn(format="%.2f"),
+        },
+    )
+

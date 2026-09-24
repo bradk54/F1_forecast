@@ -273,6 +273,63 @@ def ranked_bars(
     return fig
 
 
+def interval_bars(
+    frame: pd.DataFrame,
+    *,
+    label: str,
+    low: str,
+    high: str,
+    mid: str,
+    now: str | None = None,
+    height: int = 380,
+    xtitle: str = "",
+) -> go.Figure:
+    """A forecast range per row: a muted band from ``low`` to ``high``, a marker at ``mid``.
+
+    The band is neutral grey because its job is to say "how sure", and colour is
+    kept for the two things that name a value: the forecast mean, and -- when
+    ``now`` is given -- where the row stands today, so the distance between the
+    two markers is the points still expected to be earned.  Rows are drawn
+    top-to-bottom in the order given, which for a standings table is the
+    order that matters.
+    """
+    colors = palette()
+    ordered = frame.reset_index(drop=True)
+    names = ordered[label].tolist()
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            y=names, x=ordered[high] - ordered[low], base=ordered[low],
+            orientation="h", name="80% range",
+            marker=dict(color=colors["neutral"], cornerradius=4), opacity=0.55,
+            customdata=ordered[[low, high]].to_numpy(),
+            hovertemplate="<b>%{y}</b><br>80% range: %{customdata[0]:.0f} to "
+                          "%{customdata[1]:.0f}<extra></extra>",
+        )
+    )
+    if now is not None:
+        fig.add_trace(
+            go.Scatter(
+                y=names, x=ordered[now], mode="markers", name="today",
+                marker=dict(symbol="line-ns", size=14, color=colors["text"],
+                            line=dict(width=2, color=colors["text"])),
+                hovertemplate="<b>%{y}</b><br>today: %{x:.0f}<extra></extra>",
+            )
+        )
+    fig.add_trace(
+        go.Scatter(
+            y=names, x=ordered[mid], mode="markers", name="forecast mean",
+            marker=dict(size=9, color=colors["series"][0],
+                        line=dict(width=2, color=colors["surface"])),
+            hovertemplate="<b>%{y}</b><br>mean: %{x:.0f}<extra></extra>",
+        )
+    )
+    style(fig, height=height, xtitle=xtitle, legend=True)
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(bargap=0.45)
+    return fig
+
+
 def diverging_bars(
     frame: pd.DataFrame,
     *,

@@ -35,7 +35,8 @@ import streamlit as st
 from src import config
 from src.features import registry
 from src.features.build_features import ORDER_COL
-from src.models import monitor, store
+from src.models import forecast, monitor, season, store
+from src.models.predict import DEFAULT_MODEL
 from src.models.train import (
     DEFAULT_LOOKBACK_RACES,
     MODEL_FACTORIES,
@@ -537,10 +538,138 @@ def describe_feature(name: str) -> str:
     return feature.description if feature else ""
 
 
+# --------------------------------------------------------------------------- #
+# The finishing-order and championship forecast
+# --------------------------------------------------------------------------- #
+#
+# Unlike the retirement model there is no saved artefact to load or to go stale:
+# ``src.models.forecast`` refits from the parquets in seconds, so a forecast is
+# a pure function of the data on disk.  That makes the cache key the parquets
+# alone -- :func:`data_version` would also invalidate on every model refit and
+# log append, none of which the forecast reads.
+
+
+def forecast_version() -> tuple[float, ...]:
+    """Mtimes of the three files the forecast is built from."""
+    return (
+        _mtime(config.DNF_DATASET_PATH),
+        _mtime(config.RACE_RESULTS_PATH),
+        _mtime(config.CIRCUIT_PROFILE_PATH),
+    )
+
+
+def forecast_ready() -> tuple[bool, str]:
+    """Whether the forecast has what it needs, and if not what is missing."""
+    missing = [p.name for p in (config.DNF_DATASET_PATH, config.RACE_RESULTS_PATH)
+               if not p.exists()]
+    if missing:
+        return False, "missing " + ", ".join(missing)
+    return True, ""
+
+
+@st.cache_data(show_spinner="Loading the forecast inputs ...")
+def load_forecast_inputs(
+    version: tuple[float, ...],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+    """Dataset, raw results and profiles, exactly as ``forecast.load`` returns them."""
+    return forecast.load()
+
+
+@st.cache_data(show_spinner="Setting up the season ...", ttl=3600)
+def cached_season_setup(
+    version: tuple[float, ...], year: int, through_round: int
+) -> season.SeasonSetup:
+    """Standings, remaining calendar and fitted strengths after ``through_round``."""
+    dataset, results, profiles = load_forecast_inputs(version)
+    return forecast.season_setup(dataset, results, profiles, year, through_round)
+
+
+def forecast_position(version: tuple[float, ...]) -> tuple[int, int]:
+    """``(year, last completed round)`` -- what "now" means for the forecast."""
+    dataset, _, _ = load_forecast_inputs(version)
+    return forecast.current_position(dataset)
+
+
+@st.cache_data(show_spinner="Simulating the season ...", ttl=3600)
+def cached_championship(
+    version: tuple[float, ...], *, year: int, through_round: int,
+    team_sd: float, trials: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Both championships: ``(drivers, constructors)``."""
+    setup = cached_season_setup(version, year, through_round)
+    return forecast.championship(
+        setup, noise=season.SeasonNoise(team_sd=team_sd), trials=trials)
+
+
+@st.cache_data(show_spinner="Forecasting the next race ...", ttl=3600)
+def cached_pre_weekend(
+    version: tuple[float, ...], *, year: int, through_round: int, trials: int,
+) -> tuple[pd.DataFrame, dict]:
+    """The next unraced round per driver, and which round that is."""
+    setup = cached_season_setup(version, year, through_round)
+    race = setup.races.iloc[0]
+    event = {
+        "year": year, "round_number": int(race.RoundNumber),
+        "event_name": str(race.EventName), "race_date": pd.Timestamp(race.RaceDate),
+        "has_sprint": bool(race.has_sprint),
+    }
+    return forecast.pre_weekend_outlook(setup, trials=trials), event
+
+
+@st.cache_data(show_spinner="Forecasting from the grid ...", ttl=3600)
+def cached_post_quali(
+    version: tuple[float, ...], *, event: tuple, grid: tuple, trials: int,
+) -> pd.DataFrame:
+    """One race from a real grid.  ``event`` and ``grid`` are tuples so they hash.
+
+    ``event`` is ``(year, round, name, race_date)``; ``grid`` is
+    ``((driver_id, position), ...)``.
+    """
+    dataset, results, profiles = load_forecast_inputs(version)
+    year, round_number, name, race_date = event
+    return forecast.post_quali_outlook(
+        dataset, results, profiles, year=year, round_number=round_number,
+        race_date=race_date, event_name=name, grid=dict(grid), trials=trials)
+
+
+@st.cache_data(show_spinner="Backtesting the race ...", ttl=3600)
+def cached_backtest_race(
+    version: tuple[float, ...], *, year: int, round_number: int, trials: int,
+) -> pd.DataFrame:
+    """A completed race forecast by a model that never saw it, beside the result."""
+    dataset, results, profiles = load_forecast_inputs(version)
+    return forecast.backtest_race(dataset, results, profiles, year, round_number, trials)
+
+
+def season_calibration() -> tuple[pd.DataFrame, list[int]] | None:
+    """Season-forecast calibration from ``forecast backtest --write``, if it has been run.
+
+    Reads the CSV rather than re-running the backtest: that is minutes of
+    simulation across five seasons and belongs in a terminal.  Summarised by
+    ``season.calibration_summary`` so the page and the CLI print one definition
+    of coverage.
+    """
+    path = config.REPORTS_DIR / "season_backtest.csv"
+    if not path.exists():
+        return None
+    scored = pd.read_csv(path)
+    summary = (
+        scored.groupby(["team_sd", "driver_sd", "kind"])
+        .apply(season.calibration_summary, include_groups=False)
+        .reset_index()
+    )
+    # Which seasons were backtested depends on the ``--seasons`` the file was
+    # written with, so it is read back rather than assumed.
+    return summary, sorted(int(y) for y in scored["year"].unique())
+
+
 __all__ = [
     "Artefacts", "HIGHER_IS_BETTER", "MODELS", "STAGES", "TARGET",
-    "ORDER_COL", "DEFAULT_LOOKBACK_RACES",
-    "artefacts", "bootstrap_interval", "cached_ablation",
+    "ORDER_COL", "DEFAULT_LOOKBACK_RACES", "DEFAULT_MODEL",
+    "artefacts", "bootstrap_interval", "cached_ablation", "cached_backtest_race",
+    "cached_championship", "cached_post_quali", "cached_pre_weekend",
+    "cached_season_setup", "forecast_position", "forecast_ready",
+    "forecast_version", "load_forecast_inputs", "season_calibration",
     "cached_permutation_importance", "cached_walk_forward_races",
     "cached_walk_forward_seasons", "data_version", "describe_feature", "drift",
     "feature_groups", "load_dataset", "load_log", "load_model_unchecked",
