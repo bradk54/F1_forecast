@@ -6,6 +6,9 @@
     ./.venv/bin/python -m src.models.forecast season     # the championship forecast
     ./.venv/bin/python -m src.models.forecast next       # the next race, per driver
     ./.venv/bin/python -m src.models.forecast race 2026 14   # backtest one race
+    ./.venv/bin/python -m src.models.forecast markets pull       # race-winner prices
+    ./.venv/bin/python -m src.models.forecast markets evaluate   # model against the market
+    ./.venv/bin/python -m src.models.forecast markets log        # log this week's snapshot
 
 The sibling of :mod:`src.models.predict`, which runs the retirement model.  This
 one runs the model that retirement model was always a component of: attrition
@@ -27,6 +30,7 @@ import logging
 import sys
 from typing import Sequence
 
+import numpy as np
 import pandas as pd
 
 from src import config
@@ -471,6 +475,172 @@ def cmd_backtest(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Against the betting markets
+# --------------------------------------------------------------------------- #
+
+
+def _show(title: str, table: pd.DataFrame) -> None:
+    print(f"\n--- {title} ---")
+    print("(nothing to show)" if table.empty else table.round(3).to_string(index=False))
+
+
+def cmd_markets_pull(args) -> int:
+    """Fetch what is uncached, then rebuild the long price table from the cache."""
+    from src.data import markets
+
+    _, results, _ = load()
+    status = 0
+    if not args.skip_download:
+        counts = markets.pull(args.sources, since_year=args.since, refresh=args.refresh,
+                              minutes=args.fidelity)
+        print("pull: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+        status = 1 if counts["failed"] else 0
+    events = [e for s in args.sources for e in markets.read_cache(s)]
+    prices = markets.build_prices(events, results)
+    path = markets.save_prices(prices)
+    races = prices.groupby("source")[["Year", "RoundNumber"]].apply(
+        lambda d: len(d.drop_duplicates()))
+    print(f"wrote {path}: {len(prices):,} observations; races priced per source:")
+    print(races.to_string())
+    if status:
+        print("error: some events failed to fetch; rerun `markets pull` once the limit clears "
+              "(nothing already cached is refetched)", file=sys.stderr)
+    return status
+
+
+def cmd_markets_evaluate(args) -> int:
+    """Q1 accuracy, Q2 information, and (with ``--q3``) Q3 money, from 2025 on."""
+    from src.data import markets
+    from src.models import market_eval
+
+    dataset, results, _ = load()
+    prices = markets.load_prices()
+    clock = markets.session_clock(sorted(prices["Year"].unique()), offline=not args.online)
+    frame = market_eval.build_backfill(dataset, prices, clock, start_after=args.start)
+    if frame.empty:
+        print("error: no race has both a model forecast and a market price", file=sys.stderr)
+        return 1
+    frame = market_eval.settle(frame, results)
+    scored = frame.loc[frame["won"].notna()]
+    _show("coverage (before scoring; flagged = raw total outside "
+          f"{market_eval.TOTAL_RANGE})", market_eval.coverage(frame))
+    scores = market_eval.per_race_scores(scored)
+    q1 = market_eval.q1_table(scores)
+    _show("Q1 accuracy: winner log-loss, nats (diff = model - market, negative favours "
+          "the model; mde = smallest gap this many races could detect)", q1)
+    _show("Q2 information: log p_market, log p_model blend; wf_gain = walk-forward "
+          "blend - market (negative = the model adds)", market_eval.q2_table(scored))
+    if args.slices:
+        for source in sorted(scored["source"].unique()):
+            for snap in market_eval.SNAPSHOTS:
+                _show(f"slices: {source} / {snap.name} (Brier on p_win, diff = model - market)",
+                      market_eval.slice_table(scored, source, snap.name))
+    if args.q3:
+        _show("Q3 money: fractional Kelly after spread and fees, unit bankroll per race",
+              market_eval.q3_table(scored))
+    if args.write:
+        market_eval.write_log(backfill=frame.assign(won=frame["won"]))
+        q1.round(5).to_csv(config.REPORTS_DIR / "market_benchmark_q1.csv", index=False)
+        print(f"\nwrote {config.MARKET_LOG_PATH}")
+    return 0
+
+
+def cmd_markets_log(args) -> int:
+    """Write this week's market price beside the model's probability, before the race.
+
+    Append-only: a (race, snapshot, source) already logged is not replaced, and a
+    snapshot taken at or after lights-out is refused.  ``won`` is blank until the
+    race is classified; ``markets evaluate --write`` and the next ``log`` fill it.
+    """
+    from src.data import markets
+    from src.models import market_eval
+
+    dataset, results, profiles = load()
+    year, through = current_position(dataset)
+    setup = season_setup(dataset, results, profiles, year, through, offline=not args.online)
+    race = setup.races.iloc[0]
+    rnd = int(race.RoundNumber)
+    clock = markets.session_clock([year], offline=not args.online)
+    when = clock.loc[clock["RoundNumber"] == rnd].iloc[0]
+    now = pd.Timestamp.now(tz="UTC")
+    if now >= when["race"]:
+        raise market_eval.MarketLeakageError(
+            f"{year} R{rnd} has started; a snapshot now is not a forecast")
+
+    if args.snapshot == "pre_weekend":
+        table = pre_weekend_outlook(setup, trials=args.trials)
+        grid = None
+    else:
+        from src.models import predict
+
+        grid = predict.qualifying_grid(year, rnd)
+        if grid is None:
+            print(f"error: qualifying for {year} R{rnd} has not run, so there is no grid; "
+                  "use --snapshot pre_weekend", file=sys.stderr)
+            return 3
+        table = post_quali_outlook(
+            dataset, results, profiles, year=year, round_number=rnd,
+            race_date=race.RaceDate, event_name=race.EventName, grid=grid, trials=args.trials)
+
+    drivers = setup.drivers[["DriverId", "Abbreviation"]]
+    model = table.merge(drivers, on="Abbreviation", validate="one_to_one").rename(
+        columns={"p_win": "p_model"})
+    model = model.assign(Year=year, RoundNumber=rnd, p_baseline=np.nan, won=np.nan,
+                         p_uniform=1.0 / len(model),
+                         grid_position=model["DriverId"].map(grid) if grid else np.nan)
+
+    counts = markets.pull(args.sources, since_year=year)
+    if counts["failed"]:
+        print("error: a market fetch failed; nothing logged", file=sys.stderr)
+        return 1
+    # The race is not in the results yet, so lend the resolver last season's
+    # names for this field: the same cars, the same FullName spellings.
+    names = results.sort_values(["Year", "RoundNumber"]).drop_duplicates("DriverId", keep="last")
+    placeholder = names.loc[names["DriverId"].isin(model["DriverId"]),
+                            ["DriverId", "FullName"]].assign(
+        Year=year, RoundNumber=rnd, RaceDate=pd.Timestamp(race.RaceDate))
+    prices = markets.build_prices(
+        [e for s in args.sources for e in markets.read_cache(s)],
+        pd.concat([results, placeholder], ignore_index=True))
+    prices = prices.loc[(prices["Year"] == year) & (prices["RoundNumber"] == rnd)]
+    times = pd.DataFrame({"Year": [year], "RoundNumber": [rnd], "snapshot_ts": [now]})
+    snap = market_eval.market_snapshot(prices, model[["Year", "RoundNumber", "DriverId"]], times)
+    if snap.empty:
+        print(f"error: no market has opened for {year} R{rnd}", file=sys.stderr)
+        return 1
+    rows = market_eval.assemble_log(model, snap, args.snapshot, origin="live")
+    live, added = market_eval.append_live(rows)
+    live = market_eval.settle(live, results)
+    market_eval.write_log(live=live)
+    print(f"{year} R{rnd} {race.EventName} [{args.snapshot}]: "
+          f"{added} rows logged to {config.MARKET_LOG_PATH}"
+          + ("" if added else " (already logged; the earlier claim stands)"))
+    shown = rows.sort_values("p_market", ascending=False).head(8)
+    print(shown[["source", "DriverId", "p_model", "p_market", "age_min"]].round(3)
+          .to_string(index=False))
+    return 0
+
+
+def cmd_markets(args) -> int:
+    from src.data import market_names, markets
+    from src.models import market_eval
+
+    action = {"pull": cmd_markets_pull, "evaluate": cmd_markets_evaluate,
+              "log": cmd_markets_log}[args.action]
+    try:
+        return action(args)
+    except market_names.MarketNameError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    except market_eval.MarketLeakageError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
+    except markets.MarketFetchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 
@@ -530,6 +700,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--trials", type=int, default=4000)
     p.add_argument("--write", action="store_true")
     p.set_defaults(func=cmd_backtest)
+
+    p = sub.add_parser("markets", help="benchmark the model against Polymarket and Kalshi")
+    p.add_argument("action", choices=["pull", "evaluate", "log"])
+    p.add_argument("--sources", nargs="+", default=["kalshi", "polymarket"],
+                   choices=["kalshi", "polymarket"])
+    p.add_argument("--since", type=int, default=2025,
+                   help="pull: first season to fetch (default: 2025, where both exchanges start)")
+    p.add_argument("--refresh", action="store_true",
+                   help="pull: refetch settled events too (they cannot change)")
+    p.add_argument("--skip-download", action="store_true",
+                   help="pull: rebuild the price table from the cache, no requests")
+    p.add_argument("--fidelity", type=int, default=60, help="pull: minutes per price point")
+    p.add_argument("--start", default="2024-12-31",
+                   help="evaluate: score races after this date")
+    p.add_argument("--slices", action="store_true", help="evaluate: where they disagree")
+    p.add_argument("--q3", action="store_true",
+                   help="evaluate: also the staking simulation (run only after Q2)")
+    p.add_argument("--write", action="store_true", help="evaluate: save the log and Q1 table")
+    p.add_argument("--snapshot", choices=["pre_weekend", "post_quali"], default="pre_weekend",
+                   help="log: which model stage to record against the market")
+    p.add_argument("--trials", type=int, default=season.DEFAULT_TRIALS)
+    p.add_argument("--online", action="store_true",
+                   help="allow a network lookup for the session schedule")
+    p.set_defaults(func=cmd_markets)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
