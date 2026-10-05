@@ -336,6 +336,7 @@ def build_prices(events: list[dict], results: pd.DataFrame) -> pd.DataFrame:
     busier one.
     """
     calendar = calendar_from_results(results)
+    known = results[["DriverId", "FullName"]].drop_duplicates("DriverId")
     fields = {k: g[["DriverId", "FullName"]].drop_duplicates("DriverId")
               for k, g in results.groupby(["Year", "RoundNumber"])}
     chosen: dict[tuple, dict] = {}
@@ -347,7 +348,7 @@ def build_prices(events: list[dict], results: pd.DataFrame) -> pd.DataFrame:
             continue
         field = fields[key]
         names = [o["name"] for o in event["outcomes"] if not market_names.is_ignored(o["name"])]
-        hits = [n for n in names if _resolvable(n, field)]
+        hits = [n for n in names if _resolvable(n, field, known)]
         if not names or len(hits) < 0.5 * len(names):
             log.info("%s %s: %d of %d names fit the %s field; not an F1 race",
                      event["source"], event["event_id"], len(hits), len(names), key)
@@ -360,7 +361,7 @@ def build_prices(events: list[dict], results: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (source, year, rnd), (event, _) in chosen.items():
         resolved = market_names.resolve_outcomes(
-            [o["name"] for o in event["outcomes"]], fields[(year, rnd)])
+            [o["name"] for o in event["outcomes"]], fields[(year, rnd)], known)
         for outcome in event["outcomes"]:
             driver = resolved[outcome["name"]]
             if driver is None:
@@ -374,9 +375,9 @@ def build_prices(events: list[dict], results: pd.DataFrame) -> pd.DataFrame:
                              ignore_index=True)
 
 
-def _resolvable(name: str, field: pd.DataFrame) -> bool:
+def _resolvable(name: str, field: pd.DataFrame, known: pd.DataFrame) -> bool:
     try:
-        market_names.resolve_outcomes([name], field)
+        market_names.resolve_outcomes([name], field, known)
         return True
     except market_names.MarketNameError:
         return False

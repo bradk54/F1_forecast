@@ -78,6 +78,10 @@ SNAPSHOT_BY_NAME = {s.name: s for s in SNAPSHOTS}
 #: by the snapshot, before normalising.  The model is scored on the same field,
 #: so the driver may not be dropped.
 UNLISTED_PRICE = 0.005
+#: A book wider than this is not a quote (bid 1c / ask 99c has a 50c midpoint for a
+#: driver nobody expects to win).  Added after a first live run showed such books
+#: inflating raw totals to 1.3 and above; it removes garbage, not inconvenient data.
+MAX_QUOTE_SPREAD = 0.20
 #: Frozen.  A race whose raw listed prices sum outside this range is flagged.
 TOTAL_RANGE = (0.95, 1.15)
 #: Probabilities are clipped here before any log-loss, for every forecaster alike.
@@ -137,7 +141,8 @@ def quote(prices: pd.DataFrame) -> pd.DataFrame:
     midpoint is 0.5 for a 200-to-1 outsider, so a one-sided book is not a quote.
     """
     out = prices.copy()
-    two_sided = (out["bid"] > 0) & (out["ask"] < 1) & (out["ask"] >= out["bid"])
+    two_sided = ((out["bid"] > 0) & (out["ask"] < 1) & (out["ask"] >= out["bid"])
+                 & (out["ask"] - out["bid"] <= MAX_QUOTE_SPREAD))
     out["p"] = np.where(two_sided, (out["bid"] + out["ask"]) / 2, out["price"])
     out["spread"] = np.where(two_sided, out["ask"] - out["bid"], np.nan)
     return out.dropna(subset=["p"])
@@ -293,6 +298,9 @@ def settle(log_frame: pd.DataFrame, results: pd.DataFrame) -> pd.DataFrame:
     A prospective row is written with ``won`` blank, like ``predictions.csv``,
     and filled in here once the result exists.
     """
+    if "session_type" in results.columns:
+        # A sprint also has a classified P1; the market prices the grand prix.
+        results = results.loc[results["session_type"] == "R"]
     winners = results.loc[pd.to_numeric(results["ClassifiedPosition"], errors="coerce") == 1,
                           ["Year", "RoundNumber", "DriverId"]].assign(_won=1)
     ran = results[["Year", "RoundNumber"]].drop_duplicates().assign(_ran=1)

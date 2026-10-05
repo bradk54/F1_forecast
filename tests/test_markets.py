@@ -41,6 +41,21 @@ def test_names_resolve_however_the_listing_typed_them() -> None:
     assert got["Other"] is None and got["Driver C"] is None
 
 
+def test_a_longer_listing_and_a_dropped_suffix_still_resolve() -> None:
+    field = pd.DataFrame({"DriverId": ["antonelli", "sainz"],
+                          "FullName": ["Kimi Antonelli", "Carlos Sainz"]})
+    got = market_names.resolve_outcomes(["Andrea Kimi Antonelli", "Carlos Sainz Jr."], field)
+    assert got == {"Andrea Kimi Antonelli": "antonelli", "Carlos Sainz Jr.": "sainz"}
+
+
+def test_a_priced_non_starter_is_dropped_but_an_unknown_name_still_raises() -> None:
+    field = FIELD.iloc[:2]            # Verstappen, Norris start; Sainz is known but absent
+    got = market_names.resolve_outcomes(["Norris", "Sainz"], field, known=FIELD)
+    assert got == {"Norris": "norris", "Sainz": None}
+    with pytest.raises(market_names.MarketNameError, match="Palou"):
+        market_names.resolve_outcomes(["Palou"], field, known=FIELD)
+
+
 def test_an_unmatched_name_raises_and_reports_every_miss() -> None:
     with pytest.raises(market_names.MarketNameError) as err:
         market_names.resolve_outcomes(["Norris", "Palou", "Rossi"], FIELD)
@@ -189,6 +204,11 @@ def test_a_one_sided_book_is_not_a_quote() -> None:
     out = market_eval.quote(frame)
     assert out["p"].tolist() == pytest.approx([0.02, 0.10])   # last trade, then the midpoint
     assert np.isnan(out["spread"].iloc[0]) and out["spread"].iloc[1] == pytest.approx(0.04)
+
+
+def test_a_book_too_wide_to_be_a_quote_falls_back_to_the_last_trade() -> None:
+    frame = pd.DataFrame({"price": [0.03], "bid": [0.01], "ask": [0.99]})
+    assert market_eval.quote(frame)["p"].iloc[0] == pytest.approx(0.03)
 
 
 def _prices():
@@ -363,7 +383,9 @@ def test_a_logged_claim_is_not_overwritten(tmp_path, monkeypatch) -> None:
 def test_settle_fills_won_only_for_classified_races() -> None:
     live = _log(1).assign(origin="live", won=np.nan, RoundNumber=1)
     live["DriverId"] = ["norris", "max_verstappen", "antonelli", "x1", "x2", "x3"]
-    results = RESULTS.assign(ClassifiedPosition=["1", "2", "3"])
+    results = RESULTS.assign(ClassifiedPosition=["1", "2", "3"], session_type="R")
+    sprint = results.assign(session_type="S", DriverId=["max_verstappen", "norris", "antonelli"])
+    results = pd.concat([results, sprint], ignore_index=True)   # a sprint winner must not count
     out = market_eval.settle(live, results)
     assert out.loc[out["DriverId"] == "norris", "won"].iloc[0] == 1.0
     assert out["won"].isna().sum() == 0

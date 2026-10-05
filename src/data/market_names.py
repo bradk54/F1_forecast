@@ -23,10 +23,13 @@ from a Verstappen who is not racing.
 
 from __future__ import annotations
 
+import logging
 import re
 
 import pandas as pd
 from unidecode import unidecode
+
+log = logging.getLogger(__name__)
 
 #: Calendar days a market's stated end date may differ from the race date.
 #: Observed: Polymarket's end date is the race date or one day later.
@@ -36,6 +39,9 @@ DATE_TOLERANCE_DAYS = 2
 #: each listing with "Driver A".."Driver J" placeholders and an "Other" bucket.
 IGNORED_OUTCOMES: frozenset[str] = frozenset({
     "other", "field", "the field", "any other driver", "no winner", "none",
+    # Reserve and test drivers Kalshi lists beside the grid; none started a 2025-26 race.
+    "frederik vesti", "ayumu iwasa", "felipe drugovich", "dino beganovic",
+    "ryo hirakawa", "luke browning",
 })
 _PLACEHOLDER = re.compile(r"^driver [a-z]$")
 
@@ -62,7 +68,22 @@ def is_ignored(name: object) -> bool:
     return key in IGNORED_OUTCOMES or bool(_PLACEHOLDER.match(key))
 
 
+#: Name suffixes that one source prints and another drops ("Carlos Sainz Jr.").
+SUFFIXES = frozenset({"jr", "sr", "ii", "iii"})
+
+
 def _tokens_match(market: list[str], full: list[str]) -> bool:
+    """One name's tokens are all found in the other's, in either direction.
+
+    The listing may be shorter than the results ("Verstappen") or longer
+    ("Andrea Kimi Antonelli" against a results name of "Kimi Antonelli").
+    """
+    market = [t for t in market if t not in SUFFIXES]
+    full = [t for t in full if t not in SUFFIXES]
+    return _subset(market, full) or _subset(full, market)
+
+
+def _subset(market: list[str], full: list[str]) -> bool:
     """Every market token matches a distinct token of the full name.
 
     A one-letter token is an initial ("A. K. Antonelli") and matches any name
@@ -79,15 +100,22 @@ def _tokens_match(market: list[str], full: list[str]) -> bool:
     return True
 
 
-def resolve_outcomes(names: list[str], field: pd.DataFrame) -> dict[str, str | None]:
+def resolve_outcomes(
+    names: list[str], field: pd.DataFrame, known: pd.DataFrame | None = None,
+) -> dict[str, str | None]:
     """Map each market outcome name to a ``DriverId`` in this race's field.
 
     Args:
         names: Raw outcome names for one race.
         field: One row per driver who started, with ``DriverId`` and ``FullName``.
+        known: Every driver seen in the results, same columns.  A name that
+            matches nobody in ``field`` but does match a driver here is a
+            **non-starter** -- priced, then replaced or injured -- and resolves
+            to ``None`` rather than raising.  Scoped to the race, not global:
+            the same name is a starter in another race.
 
     Returns:
-        ``name -> DriverId``, or ``None`` for an ignored outcome.
+        ``name -> DriverId``, or ``None`` for an ignored outcome or a non-starter.
 
     Raises:
         MarketNameError: A name matches no driver, or more than one.  Names are
@@ -105,6 +133,9 @@ def resolve_outcomes(names: list[str], field: pd.DataFrame) -> dict[str, str | N
         hits = [d for d, parts in full.items() if _tokens_match(key.split(), parts)]
         if len(hits) == 1:
             resolved[raw] = hits[0]
+        elif not hits and known is not None and _in_frame(key.split(), known):
+            log.info("%r is priced but did not start this race", raw)
+            resolved[raw] = None
         else:
             problems.append(f"{raw!r}: " + ("matches no driver in the field"
                                             if not hits else f"ambiguous between {hits}"))
@@ -113,6 +144,10 @@ def resolve_outcomes(names: list[str], field: pd.DataFrame) -> dict[str, str | N
             "unresolved market outcomes (add to DRIVER_ALIASES or IGNORED_OUTCOMES in "
             "src/data/market_names.py):\n  " + "\n  ".join(problems))
     return resolved
+
+
+def _in_frame(tokens: list[str], frame: pd.DataFrame) -> bool:
+    return any(_tokens_match(tokens, normalise(n).split()) for n in frame["FullName"])
 
 
 def match_race(event_date: object, calendar: pd.DataFrame) -> tuple[int, int] | None:
