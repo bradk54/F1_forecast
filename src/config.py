@@ -45,6 +45,13 @@ CIRCUIT_PROFILE_PATH = PROCESSED_DIR / "circuit_profiles.parquet"
 RACE_RESULTS_PATH = PROCESSED_DIR / "race_results.parquet"
 DNF_DATASET_PATH = PROCESSED_DIR / "dnf_dataset.parquet"
 
+# Betting-market benchmark.  Raw API responses are cached under MARKETS_DIR and
+# never re-fetched once a market has settled; the long price table is derived
+# from them.  The log is committed: see References/market_benchmark_plan.md.
+MARKETS_DIR = RAW_DIR / "markets"
+MARKET_PRICES_PATH = PROCESSED_DIR / "market_prices.parquet"
+MARKET_LOG_PATH = REPORTS_DIR / "market_log.csv"
+
 # --------------------------------------------------------------------------- #
 # Season coverage
 # --------------------------------------------------------------------------- #

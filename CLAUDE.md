@@ -56,7 +56,7 @@ Predicts whether a driver retires from a given race. One row per driver per race
 
 ```
 src/config.py                 paths; every directory overridable by env var (F1_DATA_DIR, F1_FASTF1_CACHE, ...)
-src/data/ingest.py            the ONLY module that touches the network
+src/data/ingest.py            the module that touches the network for race data (markets.py is the other)
 src/data/generate_dataset.py  CLI orchestrator; runs the checks that gate a write
 src/data/circuits.py          static street/night/altitude reference
 src/data/f1_loader.py         standalone self-auditing season loader
@@ -254,6 +254,9 @@ src/models/forecast.py        the CLI, and the measured choices as documented co
 ./.venv/bin/python -m src.models.forecast evaluate   # held-out scores, 2024 onward
 ./.venv/bin/python -m src.models.forecast backtest   # season-sim calibration
 ./.venv/bin/python -m src.models.forecast tune       # re-run selection and tuning (each winter)
+./.venv/bin/python -m src.models.forecast markets pull       # Polymarket + Kalshi race-winner prices
+./.venv/bin/python -m src.models.forecast markets evaluate   # model vs market: Q1 accuracy, Q2 information
+./.venv/bin/python -m src.models.forecast markets log        # Saturday: write the snapshot before the race
 ```
 
 ### Rules that hold for this model
@@ -305,6 +308,38 @@ src/models/forecast.py        the CLI, and the measured choices as documented co
 - **The boosted ranker is the comparison, not the model.** With its own search
   its best setting was the most constrained one, and it ties PL on held-out RPS
   while losing on log-likelihood.
+
+## The Market Benchmark (`src/`)
+
+Does the model beat the betting market? **`References/market_benchmark_plan.md`
+is the protocol**; the snapshot times, metrics, edge threshold and hypotheses in
+it (and mirrored as *frozen* constants in `market_eval.py`) were fixed before any
+price was pulled and are not to be tuned against results.
+
+```
+src/data/markets.py          the second module allowed to touch the network; Kalshi + Polymarket,
+                             raw JSON cached under Data/raw/markets/, settled events never refetched
+src/data/market_names.py     outcome -> DriverId (scoped to one race's field), event -> race (by date)
+src/models/market_eval.py    snapshots, normalisation, Q1/Q2/Q3, the log
+Reports/market_log.csv       committed; origin = backfill | live
+tests/test_markets.py        no network
+```
+
+- **The market is a benchmark, never an input.** Feeding prices to the model
+  makes Q2 circular and the model useless where the market is thin.
+- **Unmatched names raise.** A driver silently dropped renormalises the whole
+  field. Fix it in `DRIVER_ALIASES` / `IGNORED_OUTCOMES`, not in the matcher.
+- **A snapshot at or after lights-out raises** (`MarketLeakageError`, exit 4).
+- **Live rows in `market_log.csv` are append-only.** A logged (race, snapshot,
+  source) is never replaced; backfill rows are recomputed wholesale. Keep the
+  two separable, as `model_log.csv` does with `source`.
+- **Kalshi moves settled markets to `/historical/`** with a different candle
+  schema (`close`, not `close_dollars`); both are handled. Polymarket
+  outcomes are bare surnames plus `Driver A..J` placeholders.
+- **Read "not significant" through the `mde` column.** With ~45 races only a gap
+  above ~0.15 nats registers.
+- Exit codes: 1 fetch failed / nothing to score, 2 missing dataset, 3 unresolved
+  name, 4 snapshot after lights-out.
 
 ## Conventions
 
