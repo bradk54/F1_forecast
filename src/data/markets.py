@@ -55,6 +55,9 @@ POLYMARKET_GAMMA = "https://gamma-api.polymarket.com"
 POLYMARKET_CLOB = "https://clob.polymarket.com"
 #: Polymarket's tag id for Formula 1 (the ``formula1`` tag on any F1 event).
 POLYMARKET_F1_TAG = 435
+#: The price-history endpoint refuses long windows ("interval is too long", observed
+#: at ~17 days), so an event's life is fetched in chunks of this many seconds.
+POLYMARKET_CHUNK_S = 7 * 86_400
 
 #: Seconds between requests, and the backoff schedule after a 429.
 REQUEST_PAUSE = 0.25
@@ -234,10 +237,13 @@ def fetch_polymarket_event(event: dict, minutes: int = DEFAULT_FIDELITY_MIN) -> 
         history = []
         if volume > 0 and not market_names.is_ignored(name):
             token = json.loads(m["clobTokenIds"])[0]
-            page = get_json(f"{POLYMARKET_CLOB}/prices-history", {
-                "market": token, "startTs": start, "endTs": end, "fidelity": minutes})
-            history = [{"ts": int(p["t"]), "price": _num(p["p"]), "bid": None, "ask": None,
-                        "volume": None} for p in page.get("history", [])]
+            for lo in range(start, end, POLYMARKET_CHUNK_S):
+                page = get_json(f"{POLYMARKET_CLOB}/prices-history", {
+                    "market": token, "startTs": lo,
+                    "endTs": min(lo + POLYMARKET_CHUNK_S, end), "fidelity": minutes})
+                history += [{"ts": int(p["t"]), "price": _num(p["p"]), "bid": None,
+                             "ask": None, "volume": None} for p in page.get("history", [])]
+            history = list({h["ts"]: h for h in history}.values())
         outcomes.append({"name": name, "volume": volume, "history": history})
     return {
         "source": "polymarket", "event_id": str(event["id"]), "title": event.get("title"),

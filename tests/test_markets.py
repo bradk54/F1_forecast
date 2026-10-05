@@ -100,7 +100,7 @@ def test_a_polymarket_event_is_normalised_and_skips_placeholders(monkeypatch) ->
     assert raw["outcomes"][0]["history"][1] == {"ts": 4600, "price": 0.25, "bid": None,
                                                "ask": None, "volume": None}
     assert raw["outcomes"][1]["history"] == []
-    assert len(calls) == 1   # the placeholder cost no request
+    assert len(calls) == 3   # 15 days in 7-day chunks; the placeholder cost no request
 
 
 def test_a_cached_settled_event_is_not_requested_again(tmp_path, monkeypatch) -> None:
