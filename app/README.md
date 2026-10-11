@@ -1,6 +1,7 @@
 # Dashboard
 
-A local Streamlit app over the retirement (DNF) pipeline in `src/`.
+A local Streamlit app over the finishing-order and championship forecast in
+`src/` -- and the retirement (DNF) model that is its first stage.
 
 **Double-click `Dashboard.command`** at the repository root. It starts the
 server and opens the browser; that Terminal window *is* the server, so closing
@@ -21,13 +22,18 @@ a `dashboard` launch entry there stays local to your machine.)
 
 ## What it is, and what it is not
 
-Every number comes from the same function the CLI calls — `walk_forward_races`,
-`score_predictions`, `build_inference_rows`, `monitor.drift_check`. The app
-holds caching, error handling and charts, and nothing else. If a chart and
+Every number comes from the same function the CLI calls — `forecast.championship`,
+`forecast.backtest_race`, `walk_forward_races`, `build_inference_rows`,
+`monitor.drift_check`. The app holds caching, error handling and charts, and
+nothing else. If a chart and `python -m src.models.forecast` or
 `python -m src.models.predict` ever disagree, the app has a bug.
 
+The pages follow the pipeline the forecast runs: attrition, then the finishing
+order, then points, then a season. The DNF model is presented as the first
+stage, not as a product of its own.
+
 **It reads the pipeline; it does not run it.** The one action that writes to
-disk is **Refit and save** in the sidebar, which rewrites
+disk is **Refit attrition model** in the sidebar, which rewrites
 `Models/dnf_model.joblib` and its manifest. Nothing in the app fetches new
 races — rebuild the dataset from a terminal:
 
@@ -35,19 +41,51 @@ races — rebuild the dataset from a terminal:
 ./.venv/bin/python -m src.data.generate_dataset --offline
 ```
 
-Two places reach the network, both behind an explicit click, and neither writes
-anything: looking up the next race on the calendar, and fetching a qualifying
-grid.
+One place reaches the network, behind an explicit click, and writes nothing:
+fetching a qualifying grid on the **Race** page. The next race comes from the
+forecast's own calendar, read from the FastF1 schedule offline.
 
 ## Pages
 
 | Page | Answers |
 | --- | --- |
-| **Home** | Is the model current, is it calibrated, has the sport moved? |
-| **Race weekend** | Rank a grid by retirement risk; score it once the race has run. |
-| **Model health** | Read `Reports/model_log.csv` — skill over time, drift, what the grid buys. |
-| **Lab** | Walk-forward, ablation, permutation importance, run live and compared. |
-| **Data explorer** | Where attrition lives, feature distributions, circuit profiles, the registry. |
+| **Home** | Who wins the titles, what happens next Sunday, and how far to trust it? |
+| **Championship** | Both championships simulated: points bands, title odds, pace drift. |
+| **Race** | The next race or any completed one: P(win/podium/points/out) and expected points, then the attrition stage's retirement ranking beneath. |
+| **Model** | The pipeline, each stage's features and what selection measured them to be worth, the current coefficients and position scales, and a per-driver breakdown of one race. |
+| **Track record** | Held-out finishing-order scores and season calibration, then the attrition log (`Reports/model_log.csv`). |
+| **Lab** | Walk-forward, ablation and importance for the attrition model, run live. |
+| **Data** | Where attrition lives, feature distributions, circuit profiles, the registry. |
+
+### The sidebar model card
+
+Every page carries the same card: the saved attrition model and whether it is
+fresh, both finishing-order models with their window and scales, and the season
+noise. The order-model lines are read from `STAGE_MODELS` and
+`DEFAULT_SEASON_NOISE` in `src/models/forecast.py`, so the card cannot describe
+a model the code no longer runs. The order models refit from the parquets on
+every request, so only the attrition model has a staleness to report.
+
+### Reports the pages read but do not build
+
+Two sections fill in only once their report exists, because each is minutes of
+simulation and belongs in a terminal:
+
+```bash
+./.venv/bin/python -m src.models.forecast evaluate --write   # Track record: held-out scores
+./.venv/bin/python -m src.models.forecast backtest --write   # season calibration
+```
+
+### Testing
+
+`tests/test_app.py` renders every page on synthetic data with Streamlit's
+`AppTest`. To click through the app on that data yourself:
+
+```bash
+./.venv/bin/python -m tests.app_fixture /tmp/f1_fake
+F1_PROCESSED_DIR=/tmp/f1_fake F1_MODELS_DIR=/tmp/f1_fake F1_REPORTS_DIR=/tmp/f1_fake \
+    ./.venv/bin/python -m streamlit run app/Home.py
+```
 
 ## Filling the performance log
 
@@ -66,8 +104,8 @@ overwrite a `source=live` row, and every page that mixes the two says so.
 
 ## Two things the pages will not let you do quietly
 
-**Run `post_quali` without a grid.** `grid_position` is the model's strongest
-feature and a missing slot is imputed to the back of the field, so every driver
+**Run a `post_quali` retirement model without a grid.** `grid_position` is the
+retirement model's strongest feature and a missing slot is imputed to the back of the field, so every driver
 comes out looking like a back-marker and every probability is inflated. The page
 refuses and points at `pre_weekend`, which is a model fitted without grid
 position at all.

@@ -364,6 +364,44 @@ def diverging_bars(
     return fig
 
 
+def contribution_bars(
+    frame: pd.DataFrame,
+    *,
+    label: str,
+    parts: dict[str, str],
+    total: str,
+    height: int = 520,
+    xtitle: str = "",
+) -> go.Figure:
+    """Each row's total split into its additive parts, stacked across zero.
+
+    For a linear model's attribution: ``parts`` maps a column to its legend
+    name, one categorical slot each in fixed order (so at most a handful), and
+    a dot marks the row's total, which is where the stack nets out.  Rows run
+    top to bottom in the frame's order, so sort before calling.  Hue here is
+    identity -- *which* feature -- and the bar length is the magnitude, so the
+    one-hue-per-series rule holds.
+    """
+    colors = palette()
+    ordered = frame.iloc[::-1]
+    fig = go.Figure()
+    for i, (column, name) in enumerate(parts.items()):
+        fig.add_trace(go.Bar(
+            x=ordered[column], y=ordered[label], orientation="h", name=name,
+            marker=dict(color=colors["series"][i], cornerradius=3),
+            hovertemplate="<b>%{y}</b><br>" + name + ": %{x:+.2f}<extra></extra>",
+        ))
+    fig.add_trace(go.Scatter(
+        x=ordered[total], y=ordered[label], mode="markers", name="total",
+        marker=dict(color=colors["text"], size=7, symbol="diamond"),
+        hovertemplate="<b>%{y}</b><br>total: %{x:+.2f}<extra></extra>",
+    ))
+    fig.add_vline(x=0, line=dict(color=colors["axis"], width=1))
+    style(fig, height=height, xtitle=xtitle, legend=True)
+    fig.update_layout(barmode="relative", bargap=0.3)
+    return fig
+
+
 def series_lines(
     frame: pd.DataFrame,
     *,

@@ -1,7 +1,10 @@
-"""Overview: is the model current, is it calibrated, and has the sport moved?
+"""Overview: who wins the titles, what happens next Sunday, and can I trust it?
 
-The three questions that decide whether anything else on this dashboard is worth
-reading, answered above the fold.  Everything else is a page.
+The three questions the forecast exists to answer, above the fold, with the
+caveats beside the numbers rather than a page away.  The championship and the
+next race come from ``src.models.forecast`` -- attrition, a stagewise
+Plackett-Luce over the finishers, points, then a season -- so they match what
+``python -m src.models.forecast season`` and ``next`` print.
 
 Run it from the repository root::
 
@@ -13,7 +16,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
 # Streamlit executes this file as a script rather than importing it as part of
@@ -22,10 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import charts, services  # noqa: E402
 from app.common import (  # noqa: E402
-    metric_row, page_setup, pooled_scores, require_dataset, sidebar_status,
+    fmt_pct, format_odds, metric_row, page_setup, require_dataset,
+    sidebar_models,
 )
+from src.models import forecast, season  # noqa: E402
 
-page_setup("F1 retirement model", icon="🏁")
+page_setup("F1 forecast", icon="🏁")
 
 version = services.data_version()
 if not require_dataset():
@@ -33,152 +37,137 @@ if not require_dataset():
 
 dataset = services.load_dataset(version)
 manifest = services.manifest_or_none()
-log = services.load_log(version)
+sidebar_models(dataset, manifest)
 
-sidebar_status(dataset, manifest)
+st.title("F1 forecast")
 
-st.title("Retirement model")
+ready, why = services.forecast_ready()
+if not ready:
+    st.error(f"The forecast needs the raw results as well as the dataset: {why}.")
+    st.code("./.venv/bin/python -m src.data.generate_dataset --skip-download",
+            language="bash")
+    st.stop()
+
+fc_version = services.forecast_version()
+year, through = services.forecast_position(fc_version)
 st.caption(
-    "Will a driver retire from this race? One row per driver per race, 2018 "
-    "onward. Every number here comes from the same functions the CLI calls."
+    f"{year} after round {through}. Where each driver finishes and who wins "
+    "both titles, from a model fitted only on races already run."
 )
 
 # --------------------------------------------------------------------------- #
-# Is the model current?
+# Headline
 # --------------------------------------------------------------------------- #
 
-year, rnd, event = (
-    dataset.sort_values(services.ORDER_COL).iloc[-1][
-        ["Year", "RoundNumber", "EventName"]
-    ]
-)
-fresh, freshness = services.model_staleness(dataset, manifest)
-drift_ok, drift_message = services.drift(dataset, manifest)
-
-metric_row(
-    [
-        ("Races in dataset", f"{dataset[['Year', 'RoundNumber']].drop_duplicates().shape[0]:,}",
-         f"{len(dataset):,} driver-races"),
-        ("Latest race", f"{int(year)} R{int(rnd)}", str(event)),
-        ("Model", manifest.model if manifest else "—",
-         f"{manifest.stage}, lookback {manifest.lookback_races}" if manifest else "not fitted"),
-        ("Trained base rate", f"{manifest.train_base_rate:.1%}" if manifest else "—",
-         f"{manifest.train_rows} rows" if manifest else ""),
-    ]
-)
-
-col_a, col_b = st.columns(2)
-with col_a:
-    (st.success if fresh else st.warning)(f"**Freshness** — {freshness}")
-with col_b:
-    (st.success if drift_ok else st.error)(f"**Drift** — {drift_message}")
-
-if not fresh and manifest is not None:
-    st.caption(
-        "A stale model is not wrong, only behind. Refit from the sidebar, or run "
-        "`./.venv/bin/python -m src.models.predict refresh`."
+try:
+    drivers, teams = services.cached_championship(
+        fc_version, year=year, through_round=through,
+        team_sd=float(forecast.DEFAULT_SEASON_NOISE.team_sd),
+        trials=season.DEFAULT_TRIALS,
     )
-
-st.divider()
-
-# --------------------------------------------------------------------------- #
-# Has the sport moved?
-# --------------------------------------------------------------------------- #
-
-st.subheader("Attrition is not stationary")
-st.caption(
-    "The premise the whole training-window argument rests on. A model fitted on "
-    "a settled formula predicts against a base rate the sport can walk away "
-    "from inside one winter."
-)
-
-seasons = services.season_attrition(dataset)
-left, right = st.columns([3, 2])
-
-with left:
-    fig = charts.bars(
-        seasons, x="Year", y="dnf_rate",
-        ytitle="retirement rate", xtitle="season", height=300,
-        hover=("races", "rows", "retirements", "era"),
-        reference=float(manifest.train_base_rate) if manifest else None,
-        reference_label="training base rate",
+    outlook, event = services.cached_pre_weekend(
+        fc_version, year=year, through_round=through, trials=season.DEFAULT_TRIALS,
     )
-    fig.update_yaxes(tickformat=".0%")
-    fig.update_xaxes(type="category")
-    charts.show(fig)
-
-with right:
-    display = seasons.copy()
-    display["dnf_rate"] = display["dnf_rate"].map("{:.1%}".format)
-    st.dataframe(
-        display[["Year", "races", "rows", "retirements", "dnf_rate", "era"]],
-        hide_index=True, width="stretch", height=300,
-    )
-
-# --------------------------------------------------------------------------- #
-# Is it calibrated?
-# --------------------------------------------------------------------------- #
-
-st.divider()
-st.subheader("How it has been scoring")
-
-if log.empty:
+except Exception as exc:  # noqa: BLE001 - e.g. a finished season with no races left
     st.info(
-        "No scored races yet. Backfill the log with "
-        "`./.venv/bin/python -m scripts.backfill_model_log`, or let it fill one "
-        "race at a time as `predict refresh` runs after each weekend."
+        f"Nothing left to forecast from {year} R{through}: {exc}. The "
+        "**Race** page still backtests any completed race."
     )
-else:
-    stage_options = sorted(log["stage"].dropna().unique())
-    default = manifest.stage if manifest and manifest.stage in stage_options else stage_options[-1]
-    stage = st.radio(
-        "Stage", stage_options, index=stage_options.index(default),
-        horizontal=True, key="home_stage",
-        help="pre_weekend excludes grid position; post_quali includes it. They "
-             "are different models, not the same model with more confidence.",
-    )
-    block = log.loc[log["stage"] == stage].sort_values(["year", "round"])
-    pooled = pooled_scores(block)
+    st.stop()
 
-    metric_row(
-        [
-            ("Races scored", f"{len(block):,}",
-             f"{int(block['n'].sum()):,} driver-races"),
-            ("Brier skill (pooled)", f"{pooled['brier_skill']:+.4f}",
-             "vs the training base rate"),
-            ("Mean ROC AUC", f"{pooled['roc_auc']:.3f}",
-             f"{int(pooled['auc_races'])} races where it is defined"),
-            ("Top-2 hit rate", f"{pooled['top2_rate']:.1%}",
-             f"{int(block['top2_hits'].sum())} caught in {len(block) * 2} picks"),
-        ]
-    )
-    st.caption(
-        "Pooled, not averaged per race: a race with no retirements has an "
-        "undefined AUC and a wildly negative Brier skill, so a mean over races "
-        "is dominated by the quietest Sundays."
-    )
+next_fav = outlook.sort_values("p_win").iloc[-1]
+metric_row([
+    ("Drivers' favourite", str(drivers.iloc[0]["Abbreviation"]),
+     f"{format_odds(drivers.iloc[0]['p_champion'])} to win the title"),
+    ("Constructors' favourite", str(teams.iloc[0]["TeamName"]),
+     f"{format_odds(teams.iloc[0]['p_champion'])}"),
+    (f"Next: R{event['round_number']}", str(event["event_name"]).replace(" Grand Prix", " GP"),
+     f"{event['race_date'].date()}{' · sprint' if event['has_sprint'] else ''}"),
+    ("Next race favourite", str(next_fav["Abbreviation"]),
+     f"{format_odds(next_fav['p_win'])} to win"),
+])
 
-    trend = block.copy()
-    trend["rolling"] = trend["brier_skill"].rolling(10, min_periods=3).mean()
-    fig = charts.series_lines(
-        trend, x="race_date",
-        series={"brier_skill": "per race", "rolling": "10-race mean"},
-        xtitle="", ytitle="Brier skill", height=300,
-        reference=0.0, reference_label="no better than the base rate",
+left, right = st.columns([3, 2])
+with left:
+    st.subheader("Drivers' title odds")
+    contenders = drivers.loc[drivers["p_champion"] >= 0.005].head(8)
+    if contenders.empty:
+        contenders = drivers.head(3)
+    fig = charts.ranked_bars(
+        contenders, label="Abbreviation", value="p_champion",
+        hover=("TeamName",), xtitle="P(champion)",
+        height=max(220, 34 * len(contenders)),
     )
-    fig.data[0].update(
-        mode="markers", marker=dict(size=6, line=dict(width=0)), opacity=0.45
-    )
+    fig.update_xaxes(tickformat=".0%")
     charts.show(fig)
-    st.caption(
-        "A single race's Brier skill is twenty rows of noise. The ten-race mean "
-        "is the line to read; the dots are there to show how wide the noise is."
+    st.caption("Drivers with at least a 0.5% chance. **Championship** has the "
+               "points bands and the constructors.")
+with right:
+    st.subheader(f"{event['event_name']}")
+    top = outlook.sort_values("p_win", ascending=False).head(5)
+    st.dataframe(
+        top[["Abbreviation", "TeamName", "p_win", "p_podium", "exp_points"]].rename(
+            columns={"Abbreviation": "driver", "TeamName": "team",
+                     "p_win": "P(win)", "p_podium": "P(podium)",
+                     "exp_points": "exp pts"}),
+        hide_index=True, width="stretch",
+        column_config={
+            "P(win)": st.column_config.ProgressColumn(format="%.3f", min_value=0.0,
+                                                      max_value=1.0),
+            "P(podium)": st.column_config.ProgressColumn(format="%.3f",
+                                                         min_value=0.0, max_value=1.0),
+            "exp pts": st.column_config.NumberColumn(format="%.1f"),
+        },
     )
+    st.caption("Before qualifying, so a prior rather than a forecast. **Race** "
+               "sharpens it with the grid once qualifying has run.")
+
+# --------------------------------------------------------------------------- #
+# Can I trust it?
+# --------------------------------------------------------------------------- #
 
 st.divider()
-st.caption(
-    "Pages: **Race weekend** ranks a grid · **Model health** reads the log · "
-    "**Lab** runs walk-forward, ablation and importance · **Data explorer** "
-    "browses the dataset and the feature registry · **Forecast** runs the "
-    "finishing-order model this one feeds: the next race and both championships."
-)
+st.subheader("How far to trust it")
+
+fresh, freshness = (services.model_staleness(dataset, manifest)
+                    if manifest is not None else (False, "no attrition model saved"))
+backtest = services.season_calibration()
+coverage = None
+if backtest is not None:
+    calibration, _ = backtest
+    row = calibration.loc[
+        (calibration["team_sd"].sub(forecast.DEFAULT_SEASON_NOISE.team_sd).abs() < 1e-9)
+        & (calibration["driver_sd"] == 0)
+    ].set_index("kind")
+    if not row.empty:
+        coverage = (row.loc["driver", "coverage80"], row.loc["team", "coverage80"])
+
+# Read from the evaluation report when it has been written; otherwise the
+# figures recorded in points_model_results.md when the model was fixed.
+slopes = (0.81, 0.95, 1.05)
+evaluation = services.order_evaluation()
+if evaluation is not None:
+    tuned = evaluation.loc[(evaluation["stage"] == "post_quali")
+                           & (evaluation["model"] == "selected + tuned")]
+    if len(tuned):
+        slopes = tuple(float(tuned.iloc[0][c])
+                       for c in ("calib_win", "calib_podium", "calib_points"))
+
+with st.container(border=True):
+    st.markdown(
+        "- **Race probabilities are close to calibrated after qualifying.** "
+        "On held-out 2024+ races the calibration slopes were "
+        f"{slopes[0]:.2f} for the win, {slopes[1]:.2f} for the podium and "
+        f"{slopes[2]:.2f} for the points (1.00 is perfect).\n"
+        "- **Before qualifying, read the numbers as a prior.** Without a grid "
+        "there is far less to go on, and attrition is near its base rate.\n"
+        "- **The title odds are too confident.** The season simulation's 80% "
+        "bands held "
+        + (f"{fmt_pct(coverage[0])} of drivers' and {fmt_pct(coverage[1])} of "
+           "constructors' final totals" if coverage else
+           "about 70% of drivers' and 73% of constructors' final totals")
+        + " in backtests, so odds beyond 1% and 99% print as `<1%` and `>99%`.\n"
+        f"- **Attrition model:** {freshness}."
+    )
+st.caption("Full scores and their protocol on **Track record**; the features "
+           "behind each number on **Model**.")

@@ -164,3 +164,37 @@ def test_a_saturday_forecast_refuses_a_pre_weekend_model() -> None:
             race_date="2026-03-08", event_name="E", grid={},
             spec=OrderSpec("pre", ("team_grid_pct_ewma",), stage="pre_weekend"),
             feature_config=None)
+
+
+def test_shipped_evidence_names_exactly_the_shipped_features() -> None:
+    """The Model page joins the two; a feature in one and not the other is a silent gap."""
+    from src.models import forecast
+
+    for stage, (spec, _) in forecast.STAGE_MODELS.items():
+        recorded = [feature for feature, _, _ in forecast.FEATURE_EVIDENCE[stage]]
+        assert recorded == list(spec.features)
+        assert spec.stage == stage
+
+
+def test_a_season_setup_keeps_the_features_its_next_race_was_forecast_from() -> None:
+    from src.data.generate_dataset import build_dataset
+    from src.models import forecast
+    from tests.synthetic import make_order_results
+
+    results = make_order_results(seed=5)
+    seen = (results["Year"] < 2023) | (results["RoundNumber"] <= 8)
+    dataset, _ = build_dataset(results.loc[seen], None, circuit_reference=False,
+                               run_checks=False)
+    setup = forecast.season_setup(dataset, results, None, 2023, 8)
+    spec = forecast.PRE_WEEKEND_SPEC
+    assert list(setup.features["DriverId"]) == list(setup.drivers["DriverId"])
+    assert list(setup.features.columns) == ["DriverId", *spec.features]
+
+    model, _ = forecast.fitted_order_model(dataset, "pre_weekend", year=2023,
+                                           through_round=8)
+    assert list(model.features) == list(spec.features)
+    # The point fit ranks the next race the way the bootstrap mean does, give
+    # or take a close pair: it is the same window and the same features.
+    point = pd.Series(model.strength(setup.features)).rank()
+    boot = pd.Series(setup.strength[:, 0, :].mean(axis=0)).rank()
+    assert point.corr(boot, method="spearman") > 0.9

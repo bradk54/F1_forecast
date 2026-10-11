@@ -37,6 +37,7 @@ from src import config
 from src.features.order_features import OrderFeatureConfig, add_order_features
 from src.models import order_eval, season, tuning
 from src.models.order_eval import OrderSpec
+from src.models.ranking import PlackettLuce
 
 log = logging.getLogger(__name__)
 
@@ -129,6 +130,32 @@ _UNTUNED = dict(l2=1.0, lookback_races=60, truncate=None, race_halflife=None,
 #: ``forecast backtest`` once it does, and again whenever the training window
 #: is re-tuned.  Full tables: ``References/points_model_results.md`` Sec 10.
 DEFAULT_SEASON_NOISE = season.SeasonNoise(team_sd=0.5, driver_sd=0.0)
+
+#: The shipped model at each stage, keyed the way every caller names a stage.
+STAGE_MODELS: dict[str, tuple[OrderSpec, OrderFeatureConfig]] = {
+    "pre_weekend": (PRE_WEEKEND_SPEC, PRE_WEEKEND_FEATURES),
+    "post_quali": (POST_QUALI_SPEC, POST_QUALI_FEATURES),
+}
+
+#: What each shipped feature was measured to be worth, in the order forward
+#: selection took it: ``(feature, removal cost in nats a race, paired t)``.
+#: The first feature of each stage was taken against an empty model, so it has
+#: no removal cost on the same footing and carries ``None``.  The numbers are
+#: those quoted beside the specs above and in ``points_model_results.md`` Sec 5;
+#: they are a record of the 2020-2023 selection, not recomputed, and ``tune``
+#: each winter is what refreshes them.
+FEATURE_EVIDENCE: dict[str, tuple[tuple[str, float | None, float | None], ...]] = {
+    "pre_weekend": (
+        ("team_finish_pct_ewma", None, None),
+        ("driver_mate_grid_delta_ewma", 0.61, 4.8),
+        ("team_grid_pct_season", 0.31, 2.8),
+    ),
+    "post_quali": (
+        ("grid_position", None, None),
+        ("team_rank_in_field", 0.39, 3.1),
+        ("driver_grid_pct_ewma", 0.21, 2.5),
+    ),
+}
 
 
 def ladder(stage: str) -> list[tuple[OrderSpec, OrderFeatureConfig]]:
@@ -282,6 +309,27 @@ def current_position(
     year = year or int(dataset["Year"].max())
     through = through_round or int(dataset.loc[dataset["Year"] == year, "RoundNumber"].max())
     return year, through
+
+
+def fitted_order_model(
+    dataset: pd.DataFrame, stage: str, *, year: int, through_round: int,
+) -> tuple[PlackettLuce, pd.DataFrame]:
+    """The shipped order model for ``stage``, point-fitted through ``through_round``.
+
+    The same training window and decay the forecast uses for the race after
+    ``through_round``, without the bootstrap: one fit, for reading the
+    coefficients and position scales rather than for forecasting.  Returns the
+    model and the feature frame over every race in ``dataset``, so a caller can
+    explain any row with :meth:`PlackettLuce.contributions` -- the features are
+    strictly prior-race, so a completed race's row holds exactly what a
+    forecast of it would have seen.
+    """
+    spec, feature_config = STAGE_MODELS[stage]
+    frame = add_order_features(dataset, feature_config)
+    seen = lambda f: (f["Year"] < year) | (  # noqa: E731
+        (f["Year"] == year) & (f["RoundNumber"] <= through_round))
+    train, _ = season._training_rows(frame.loc[seen(frame)], dataset.loc[seen(dataset)], spec)
+    return order_eval.fit_order_model(train, spec, age=train["age"].to_numpy()), frame
 
 
 def season_setup(dataset, results, profiles, year, through_round, offline=True):

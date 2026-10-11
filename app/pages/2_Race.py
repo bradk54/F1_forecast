@@ -1,28 +1,24 @@
-"""Rank a grid by retirement risk — the "who do I flag on Sunday" page.
+"""One race: the finishing order, and the retirement risk underneath it.
 
-Two modes, and the difference between them is the whole point:
+The page a race weekend is read from.  Pick the next race or any completed
+one; the finishing-order forecast comes first because that is the product, and
+the attrition stage -- the saved retirement model, ranked -- sits beneath it.
 
-* **A race in the dataset** is a backtest.  If the saved model was trained
-  through that race it has already seen the answer, and the page says so rather
-  than quietly showing flattering numbers.
-* **An upcoming race** has no feature row, so one is built by appending
-  placeholder rows to the raw results and running the ordinary feature builders
-  over the whole thing.  That is safe only because every feature in this
-  pipeline is strictly prior-race, which is the same property that makes the
-  training numbers trustworthy.
+**Stage follows what the race has, not a setting.**  Before qualifying the
+forecast is the pre-weekend model, fitted without grid position at all.  With a
+grid -- fetched after qualifying, or a completed race's own -- it is the
+post-qualifying model.  They are different models, not one model at two
+confidence levels.
 
-**Stage is not a confidence dial.**  ``grid_position`` is the model's strongest
-feature, and a missing grid is imputed to the back of the field — which inflates
-every prediction into something that looks like an opinion rather than an
-absence of information.  So a ``post_quali`` run without a grid is refused here
-exactly as it is in the CLI, and the escape hatch is labelled for what it does.
+**A completed race is always out-of-sample for the finishing order**: it is
+refitted on the races before it.  The saved retirement model is not refitted,
+so if it was trained through the race, the attrition section says so.
 
-Above the ranking sits the **finishing order** from ``src.models.forecast`` --
-the model this one feeds, and where most of the points are decided.  It has no
-saved artefact, so it is never in-sample and never stale, it takes its stage
-from the race rather than the sidebar, and it runs before any of the guards
-below: none of them apply to it, and a refused retirement ranking should not
-take the forecast down with it.
+**The retirement guard survives the merge.**  ``grid_position`` is the
+retirement model's strongest feature and a missing grid is imputed to the back
+of the field, so a ``post_quali`` retirement model with no grid is refused here
+exactly as in the CLI.  That refusal stops only the attrition section; the
+finishing order above it has already rendered.
 """
 
 from __future__ import annotations
@@ -39,173 +35,149 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from app import charts, services  # noqa: E402
 from app.common import (  # noqa: E402
     fmt_pct, format_odds, metric_row, outlook_table, page_setup,
-    require_dataset, sidebar_status,
+    require_dataset, sidebar_models, sidebar_trials,
 )
-from src.models import monitor, season, store  # noqa: E402
+from src.models import monitor, store  # noqa: E402
 from src.models.predict import (  # noqa: E402
-    build_inference_rows, entry_list, next_event, qualifying_grid,
+    build_inference_rows, entry_list, qualifying_grid,
 )
 
-page_setup("Race weekend", icon="🏎️")
+page_setup("Race", icon="🏎️")
 
 version = services.data_version()
 if not require_dataset():
     st.stop()
+ready, why = services.forecast_ready()
+if not ready:
+    st.title("Race")
+    st.error(f"The forecast needs the raw results as well as the dataset: {why}.")
+    st.code("./.venv/bin/python -m src.data.generate_dataset --skip-download",
+            language="bash")
+    st.stop()
 
 dataset = services.load_dataset(version)
 manifest = services.manifest_or_none()
-sidebar_status(dataset, manifest)
+sidebar_models(dataset, manifest)
+trials = sidebar_trials()
 
-st.title("Race weekend")
+fc_version = services.forecast_version()
+fc_year, fc_through = services.forecast_position(fc_version)
+results, profiles = services.load_raw(version)
 
-if not services.artefacts().results:
-    st.error("No raw results on disk; an upcoming race cannot be assembled.")
-    st.stop()
-
-# The saved retirement model's stage decides whether a completed race's grid
-# is passed to it.  The forecast below needs no saved model at all, so its
-# absence is reported where the retirement ranking would be, not here.
+# The saved retirement model's stage decides whether a grid is passed to it.
 stage = manifest.stage if manifest is not None else None
+
+st.title("Race")
 
 # --------------------------------------------------------------------------- #
 # Pick a race
 # --------------------------------------------------------------------------- #
 
-races = services.race_index(version, dataset)
 choice = st.radio(
-    "Race", ["A completed race (backtest)", "The next scheduled race"],
-    horizontal=True, key="weekend_mode",
+    "Race", ["The next race", "A completed race (backtest)"],
+    horizontal=True, key="race_mode",
 )
 
-event: dict | None = None
+event: dict
 grid: dict[str, float] | None = None
 grid_source = "not supplied"
+outlook = None
+fc_source = ""
 
-if choice.startswith("A completed"):
-    label = st.selectbox("Which race", races["label"], index=0)
+if choice == "The next race":
+    try:
+        pre_outlook, upcoming = services.cached_pre_weekend(
+            fc_version, year=fc_year, through_round=fc_through, trials=trials)
+    except Exception as exc:  # noqa: BLE001 - e.g. no calendar for a finished season
+        st.error(f"Could not set up the next race: {exc}")
+        st.stop()
+    event = {k: upcoming[k] for k in ("year", "round_number", "event_name", "race_date")}
+    st.subheader(f"{event['year']} R{event['round_number']} {event['event_name']}")
+    st.caption(
+        f"{pd.Timestamp(event['race_date']).date()}"
+        f"{' · sprint weekend' if upcoming['has_sprint'] else ''}"
+    )
+
+    fetched = st.session_state.get("race_grid")
+    if fetched is not None and fetched["key"] != (event["year"], event["round_number"]):
+        fetched = None  # a grid for a race that has since been run
+    if st.button("Fetch the qualifying grid (one network request)", key="race_fetch",
+                 help="Penalties are not applied, so a penalised car is forecast "
+                      "from its qualifying slot. Nothing is written."):
+        with st.spinner("Loading qualifying ..."):
+            try:
+                loaded = qualifying_grid(event["year"], event["round_number"])
+            except Exception as exc:  # noqa: BLE001 - network and cache both fail here
+                loaded = None
+                st.error(f"Could not load qualifying: {exc}")
+        if loaded is None:
+            st.warning("Qualifying has not run, or could not be loaded.")
+            st.session_state.pop("race_grid", None)
+            fetched = None
+        else:
+            fetched = {"key": (event["year"], event["round_number"]), "grid": loaded}
+            st.session_state["race_grid"] = fetched
+
+    if fetched is not None:
+        grid, grid_source = fetched["grid"], "qualifying"
+        outlook = services.cached_post_quali(
+            fc_version,
+            event=(event["year"], event["round_number"], event["event_name"],
+                   pd.Timestamp(event["race_date"])),
+            grid=tuple(sorted(grid.items())), trials=trials,
+        )
+        fc_source = ("the **post-qualifying** model on the qualifying grid "
+                     "(penalties not yet applied)")
+    else:
+        outlook = pre_outlook
+        fc_source = ("the **pre-weekend** model, fitted without a grid -- a "
+                     "prior, not a forecast. Fetch the grid after qualifying "
+                     "for the sharper one")
+else:
+    races = services.race_index(version, dataset)
+    # The post-qualifying model wants a training window behind it; the first
+    # seasons have too little history to fit honestly.
+    first = min(int(races["Year"].min()) + 3, int(races["Year"].max()))
+    races = races.loc[races["Year"] >= first].reset_index(drop=True)
+    label = st.selectbox("Which completed race", races["label"], index=0, key="race_pick")
     row = races.loc[races["label"] == label].iloc[0]
     event = {
         "year": int(row["Year"]), "round_number": int(row["RoundNumber"]),
         "event_name": str(row["EventName"]),
         "race_date": pd.Timestamp(row[services.ORDER_COL]),
     }
-    if stage == "post_quali":
-        # The real grid is already in the dataset for a race that has run, so
-        # there is no reason to go to the network for it.
-        actual = dataset.loc[
-            (dataset["Year"] == event["year"])
-            & (dataset["RoundNumber"] == event["round_number"])
-        ]
-        grid = {
-            str(r["DriverId"]): float(r["grid_position"])
-            for _, r in actual.iterrows()
-            if pd.notna(r.get("grid_position"))
-        } or None
-        grid_source = "the dataset's own recorded grid"
-else:
-    st.caption(
-        "Reading the calendar needs FastF1, which will use the network if the "
-        "cache is cold. Nothing is written."
-    )
-    if st.button("Look up the next race", type="primary"):
-        try:
-            st.session_state["weekend_next"] = next_event(dataset)
-        except Exception as exc:  # noqa: BLE001 - network and cache both fail here
-            st.session_state["weekend_next"] = None
-            st.error(f"Could not read the calendar: {exc}")
-    event = st.session_state.get("weekend_next")
-    if event is None:
-        st.info("No upcoming race loaded yet.")
-    else:
-        st.success(
-            f"{event['year']} R{event['round_number']} {event['event_name']} — "
-            f"{pd.Timestamp(event['race_date']).date()}"
-        )
-        fetch = st.checkbox(
-            "Fetch the grid from qualifying (uses the network)", value=False
-        )
-        if fetch:
-            with st.spinner("Loading qualifying ..."):
-                grid = qualifying_grid(event["year"], event["round_number"])
-            grid_source = "qualifying" if grid else "qualifying (not available)"
+    # The real grid is already in the dataset for a race that has run, so
+    # there is no reason to go to the network for it.
+    actual = dataset.loc[(dataset["Year"] == event["year"])
+                         & (dataset["RoundNumber"] == event["round_number"])]
+    grid = {str(r["DriverId"]): float(r["grid_position"])
+            for _, r in actual.iterrows() if pd.notna(r.get("grid_position"))} or None
+    grid_source = "the race's recorded grid"
+    try:
+        outlook = services.cached_backtest_race(
+            fc_version, year=event["year"], round_number=event["round_number"],
+            trials=trials)
+    except Exception as exc:  # noqa: BLE001 - a fit failure is the answer here
+        st.error(f"Could not forecast this race: {exc}")
+    fc_source = ("the post-qualifying model on the real grid, fitted **only on "
+                 "the races before this one** -- out-of-sample by construction")
 
-if event is None:
-    st.stop()
-
-results, profiles = services.load_raw(version)
-already_run = bool((
-    (results["Year"] == event["year"])
-    & (results["RoundNumber"] == event["round_number"])
-).any())
+already_run = choice != "The next race"
 
 # --------------------------------------------------------------------------- #
 # Finishing order
 # --------------------------------------------------------------------------- #
-#
-# The model the retirement model feeds.  It needs nothing saved -- it refits
-# from the parquets -- so it runs whatever the sidebar model's stage is, and it
-# picks its own stage from what the race has: a completed race is forecast from
-# its real grid by a fit on the races before it, an upcoming one from the
-# qualifying grid when fetched and from the pre-weekend model when not.  The
-# pre-weekend model is fitted without a grid at all, so unlike the retirement
-# model above it needs no escape hatch for a missing one.
-
-st.subheader("Finishing order")
-
-fc_version = services.forecast_version()
-outlook = None
-try:
-    if already_run:
-        outlook = services.cached_backtest_race(
-            fc_version, year=event["year"], round_number=event["round_number"],
-            trials=season.DEFAULT_TRIALS,
-        )
-        fc_source = (
-            "the post-qualifying model on the real grid, fitted **only on the "
-            "races before this one** -- out-of-sample even where the ranking "
-            "below is not"
-        )
-    elif grid is not None:
-        outlook = services.cached_post_quali(
-            fc_version,
-            event=(event["year"], event["round_number"], event["event_name"],
-                   pd.Timestamp(event["race_date"])),
-            grid=tuple(sorted(grid.items())), trials=season.DEFAULT_TRIALS,
-        )
-        fc_source = (
-            "the post-qualifying model on the qualifying grid (penalties not "
-            "yet applied)"
-        )
-    else:
-        fc_year, fc_through = services.forecast_position(fc_version)
-        outlook, upcoming = services.cached_pre_weekend(
-            fc_version, year=fc_year, through_round=fc_through,
-            trials=season.DEFAULT_TRIALS,
-        )
-        fc_source = (
-            "the **pre-weekend** model, fitted without a grid -- a prior, not a "
-            "forecast. Fetch the grid after qualifying for the sharper one"
-        )
-        if (upcoming["year"], upcoming["round_number"]) != (
-            event["year"], event["round_number"]
-        ):
-            st.warning(
-                f"The forecast's next race is {upcoming['year']} "
-                f"R{upcoming['round_number']}, not this one; showing nothing "
-                "rather than the wrong race."
-            )
-            outlook = None
-except Exception as exc:  # noqa: BLE001 - a fit failure is the answer here
-    st.error(f"Could not forecast the finishing order for this race: {exc}")
 
 if outlook is not None:
-    st.caption(f"From {fc_source}. Same numbers as the **Forecast** page.")
+    (st.success if grid is not None else st.info)(f"From {fc_source}.")
     favourite = outlook.sort_values("p_win").iloc[-1]
     items = [
         ("Favourite", str(favourite["Abbreviation"]),
          f"{format_odds(favourite['p_win'])} to win"),
         ("Most expected points", str(outlook.iloc[0]["Abbreviation"]),
          f"{outlook.iloc[0]['exp_points']:.1f} points"),
+        ("Cars expected out", f"{outlook['p_dnf'].sum():.1f}",
+         f"of {len(outlook)} entries"),
     ]
     if "finished" in outlook.columns:
         winner = outlook.loc[outlook["finished"] == 1]
@@ -213,14 +185,24 @@ if outlook is not None:
             items.append(("Winner", str(winner.iloc[0]["Abbreviation"]),
                           f"forecast {format_odds(winner.iloc[0]['p_win'])}"))
     metric_row(items)
-    outlook_table(outlook)
+
+    left, right = st.columns([2, 3])
+    with left:
+        fig = charts.ranked_bars(
+            outlook, label="Abbreviation", value="exp_points", highlight=3,
+            hover=("TeamName",), xtitle="expected points",
+            height=max(360, 26 * len(outlook)),
+        )
+        charts.show(fig)
+    with right:
+        outlook_table(outlook)
     st.caption(
-        "P(out) here comes from the retirement model refitted on the races "
-        "before this one, so it can differ from the P(dnf) ranking below, "
-        "which is the saved model. Expected points is roughly P(finish) x the "
-        "points the finishing order would earn."
+        "P(out) is the chance of not finishing *or* not starting, from the "
+        "attrition stage. A retired car scores nothing, so expected points is "
+        "roughly P(finish) x the points its finishing order would earn."
         + (" `result` is the classified position; blank did not finish."
            if "finished" in outlook.columns else "")
+        + " **Model** shows which features put each driver where."
     )
 
 # --------------------------------------------------------------------------- #
@@ -228,10 +210,17 @@ if outlook is not None:
 # --------------------------------------------------------------------------- #
 
 st.divider()
-st.subheader("Retirement risk")
+st.subheader("Attrition stage: who retires")
+st.caption(
+    "The forecast's first stage, on its own: each car's chance of not "
+    "finishing, ranked. This is the saved retirement model, which can be "
+    "rescored after the race and logged -- the finishing order above refits "
+    "its own copy on the races before this one, so their numbers can differ."
+)
 
 if manifest is None:
-    st.error("No model has been fitted. Use **Refit and save** in the sidebar.")
+    st.error("No attrition model has been saved. Use **Refit attrition model** "
+             "in the sidebar.")
     st.stop()
 
 st.caption(
@@ -247,16 +236,16 @@ st.caption(
 
 allow_missing = False
 if stage == "post_quali" and grid is None:
-    st.error(
-        "**No grid, and this is a `post_quali` model.** A missing grid slot is "
-        "imputed to the back of the field, so every driver would be scored as a "
-        "back-marker and every probability would come out inflated — roughly "
-        "0.20–0.46 against a 14% base rate. That looks like a model with an "
-        "opinion rather than one with no information."
-    )
-    st.caption(
-        "Refit at `pre_weekend` in the sidebar for a model fitted without grid "
-        "position at all, which is the correct thing to run before qualifying."
+    # Refused, as in the CLI -- but as information rather than an error: on the
+    # next-race view before qualifying this is the expected state, not a fault.
+    st.info(
+        "**The retirement ranking needs the grid.** The saved attrition model "
+        "is `post_quali`, and a missing grid slot is imputed to the back of "
+        "the field, so every driver would be scored as a back-marker -- "
+        "roughly 0.20-0.46 against a 14% base rate. Fetch the qualifying grid "
+        "above, or refit at `pre_weekend` in the sidebar for a model fitted "
+        "without grid position at all. The finishing order above already "
+        "carries its own pre-weekend attrition."
     )
     allow_missing = st.checkbox(
         "Predict anyway, treating every driver as starting last", value=False

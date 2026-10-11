@@ -1,4 +1,10 @@
-"""Walk-forward, ablation and importance — the experiments, run on demand.
+"""Walk-forward, ablation and importance for the attrition (DNF) model.
+
+The attrition model is the first stage of the forecast, and the only stage
+cheap enough to re-run experiments on interactively.  The finishing-order
+model's selection and tuning take minutes and belong in a terminal
+(``python -m src.models.forecast tune``); its results are on the Model and
+Track record pages.
 
 Nothing on this page reads a saved artefact.  Every number is computed from the
 dataset by the same functions the CLI and the tests use, so a configuration you
@@ -31,10 +37,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app import charts, services  # noqa: E402
 from app.common import (  # noqa: E402
-    calibration_bins, metric_row, page_setup, require_dataset, sidebar_status,
+    calibration_bins, metric_row, page_setup, require_dataset, sidebar_models,
 )
 
-page_setup("Lab", icon="🔬")
+page_setup("Lab: attrition model", icon="🔬")
 
 version = services.data_version()
 if not require_dataset():
@@ -42,10 +48,11 @@ if not require_dataset():
 
 dataset = services.load_dataset(version)
 manifest = services.manifest_or_none()
-sidebar_status(dataset, manifest)
+sidebar_models(dataset, manifest)
 
-st.title("Lab")
+st.title("Lab: attrition model")
 st.caption(
+    "Experiments on the forecast's first stage -- the chance each car retires. "
     "Walk-forward evaluation, feature ablation and permutation importance, "
     "computed live from the dataset. Results are cached for an hour per "
     "configuration."
