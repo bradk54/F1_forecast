@@ -641,6 +641,101 @@ def cached_backtest_race(
     return forecast.backtest_race(dataset, results, profiles, year, round_number, trials)
 
 
+def model_card() -> list[dict]:
+    """Every model the forecast runs on, as the sidebar card prints it.
+
+    Read from the shipped constants in :mod:`src.models.forecast`, never typed
+    out, so the card cannot describe a model the code no longer runs.
+    """
+    rows = []
+    for stage, (spec, _) in forecast.STAGE_MODELS.items():
+        rows.append({
+            "name": "Finishing order", "stage": stage,
+            "detail": (f"{len(spec.features)} features · lookback "
+                       f"{spec.lookback_races} · {spec.n_scales} scales"),
+            "features": spec.features,
+        })
+    noise = forecast.DEFAULT_SEASON_NOISE
+    rows.append({
+        "name": "Season noise", "stage": "",
+        "detail": f"team_sd {noise.team_sd} (provisional)", "features": (),
+    })
+    return rows
+
+
+@st.cache_resource(show_spinner="Fitting the order model ...", ttl=3600)
+def cached_order_fit(
+    version: tuple[float, ...], stage: str, year: int, through_round: int,
+):
+    """``(model, feature frame)``: the shipped spec point-fitted through a round.
+
+    A resource rather than data: the frame is only read, and copying it on
+    every rerun -- what ``cache_data`` does -- buys nothing.
+    """
+    dataset, _, _ = load_forecast_inputs(version)
+    return forecast.fitted_order_model(dataset, stage, year=year,
+                                       through_round=through_round)
+
+
+def previous_race(dataset: pd.DataFrame, year: int, round_number: int) -> tuple[int, int] | None:
+    """The race before ``(year, round_number)``, across a winter if need be."""
+    keys = (dataset[["Year", "RoundNumber"]].drop_duplicates()
+            .sort_values(["Year", "RoundNumber"]))
+    earlier = keys.loc[(keys["Year"] < year)
+                       | ((keys["Year"] == year) & (keys["RoundNumber"] < round_number))]
+    if earlier.empty:
+        return None
+    last = earlier.iloc[-1]
+    return int(last["Year"]), int(last["RoundNumber"])
+
+
+def explain_next_race(version: tuple[float, ...], year: int, through_round: int) -> pd.DataFrame:
+    """The pre-weekend forecast for the next race, feature by feature.
+
+    The feature values are the ones the championship and next-race numbers
+    were computed from (kept on the season setup); the contributions come from
+    a point fit on the same window, since the forecast itself mixes bootstrap
+    refits and has no single coefficient vector.
+    """
+    setup = cached_season_setup(version, year, through_round)
+    model, _ = cached_order_fit(version, "pre_weekend", year, through_round)
+    values = setup.features
+    names = setup.drivers[["DriverId", "Abbreviation", "TeamName"]]
+    return _explained(model, names.merge(values, on="DriverId", how="left"))
+
+
+def explain_race(version: tuple[float, ...], year: int, round_number: int) -> pd.DataFrame:
+    """A completed race under the post-qualifying model fitted on the races before it.
+
+    Every order feature is strictly prior-race, so the race's own rows hold
+    exactly what a Saturday forecast of it saw.
+    """
+    dataset, _, _ = load_forecast_inputs(version)
+    before = previous_race(dataset, year, round_number)
+    if before is None:
+        raise ValueError(f"no race before {year} R{round_number} to fit on")
+    model, frame = cached_order_fit(version, "post_quali", *before)
+    rows = frame.loc[(frame["Year"] == year) & (frame["RoundNumber"] == round_number)]
+    return _explained(model, rows[["DriverId", "Abbreviation", "TeamName",
+                                   *model.features]].reset_index(drop=True))
+
+
+def _explained(model, rows: pd.DataFrame) -> pd.DataFrame:
+    """Values, contributions (``c_`` prefix) and total strength, strongest first.
+
+    Contributions are centred on the field so each one reads as "relative to
+    the average car in this race" -- the only frame of reference Plackett-Luce
+    has, since a shift common to every car cancels.
+    """
+    parts = model.contributions(rows)
+    parts = parts - parts.mean()
+    out = rows.copy()
+    for feature in model.features:
+        out[f"c_{feature}"] = parts[feature].to_numpy()
+    out["strength"] = parts.sum(axis=1).to_numpy()
+    return out.sort_values("strength", ascending=False, ignore_index=True)
+
+
 def season_calibration() -> tuple[pd.DataFrame, list[int]] | None:
     """Season-forecast calibration from ``forecast backtest --write``, if it has been run.
 
@@ -663,15 +758,29 @@ def season_calibration() -> tuple[pd.DataFrame, list[int]] | None:
     return summary, sorted(int(y) for y in scored["year"].unique())
 
 
+def order_evaluation() -> pd.DataFrame | None:
+    """Held-out finishing-order scores from ``forecast evaluate --write``, if run.
+
+    Read from the CSV rather than recomputed: the evaluation walks every race
+    from 2024 forward with thousands of samples each, which is a terminal job.
+    """
+    path = config.REPORTS_DIR / "points_model_evaluation.csv"
+    if not path.exists():
+        return None
+    return pd.read_csv(path)
+
+
 __all__ = [
     "Artefacts", "HIGHER_IS_BETTER", "MODELS", "STAGES", "TARGET",
     "ORDER_COL", "DEFAULT_LOOKBACK_RACES", "DEFAULT_MODEL",
     "artefacts", "bootstrap_interval", "cached_ablation", "cached_backtest_race",
-    "cached_championship", "cached_post_quali", "cached_pre_weekend",
+    "cached_championship", "cached_order_fit", "cached_post_quali", "cached_pre_weekend",
     "cached_season_setup", "forecast_position", "forecast_ready",
     "forecast_version", "load_forecast_inputs", "season_calibration",
     "cached_permutation_importance", "cached_walk_forward_races",
     "cached_walk_forward_seasons", "data_version", "describe_feature", "drift",
+    "explain_next_race", "explain_race", "model_card", "order_evaluation",
+    "previous_race",
     "feature_groups", "load_dataset", "load_log", "load_model_unchecked",
     "load_raw", "manifest_or_none", "model_staleness", "race_attrition",
     "race_index", "refit_and_save", "registry_table", "rolling_summary",

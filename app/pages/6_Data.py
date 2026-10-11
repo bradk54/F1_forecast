@@ -23,7 +23,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app import charts, services  # noqa: E402
-from app.common import metric_row, page_setup, require_dataset, sidebar_status  # noqa: E402
+from app.common import metric_row, page_setup, require_dataset, sidebar_models  # noqa: E402
 
 page_setup("Data explorer", icon="🔎")
 
@@ -33,7 +33,7 @@ if not require_dataset():
 
 dataset = services.load_dataset(version)
 manifest = services.manifest_or_none()
-sidebar_status(dataset, manifest)
+sidebar_models(dataset, manifest)
 
 st.title("Data explorer")
 

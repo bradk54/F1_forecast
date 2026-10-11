@@ -144,6 +144,10 @@ class SeasonSetup:
     p_dnf: np.ndarray  # (drivers,) grand-prix retirement probability
     p_dns: float  # chance an entrant does not start
     team_index: np.ndarray  # (drivers,) row of ``teams`` each driver scores for
+    #: The next race's feature rows, aligned with ``drivers`` -- exactly what
+    #: the strengths for ``races.iloc[0]`` were computed from, kept so a
+    #: forecast can be explained from its own inputs rather than a rebuild.
+    features: pd.DataFrame | None = None
 
 
 def standings(
@@ -389,6 +393,7 @@ def prepare_season(
         p_dnf=p_dnf,
         p_dns=p_dns,
         team_index=team_index.to_numpy(),
+        features=blocks[0][["DriverId", *spec.features]].reset_index(drop=True),
     )
 
 

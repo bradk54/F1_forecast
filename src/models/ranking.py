@@ -368,6 +368,21 @@ class PlackettLuce:
             raise RuntimeError("fit the model first")
         return self._design(frame) @ self.coef_
 
+    def contributions(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Each feature's share of every row's log-strength, columns as features.
+
+        The rows sum to :meth:`strength` exactly, because the model is linear
+        in the standardised design.  This is what makes one driver's number
+        explainable -- "team pace +0.9, team-mate delta -0.3" -- without a
+        separate attribution method that could disagree with the model.  Only
+        differences between cars *in the same race* mean anything: a constant
+        added to every car cancels in the likelihood.
+        """
+        if self.coef_ is None:
+            raise RuntimeError("fit the model first")
+        return pd.DataFrame(self._design(frame) * self.coef_,
+                            columns=list(self.features), index=frame.index)
+
     def coefficients(self) -> pd.Series:
         """Coefficients on the standardised features, largest effect first."""
         return (pd.Series(self.coef_, index=list(self.features))

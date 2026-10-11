@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import services  # noqa: E402
 from src import config  # noqa: E402
+from src.models import season  # noqa: E402
 
 
 def page_setup(title: str, *, icon: str = "🏁") -> None:
@@ -69,32 +70,60 @@ def metric_row(items: Sequence[tuple[str, str, str]]) -> None:
                 st.caption(caption)
 
 
-def sidebar_status(dataset: pd.DataFrame, manifest) -> None:
-    """The saved model, and the one control that writes to disk.
+def sidebar_models(dataset: pd.DataFrame, manifest) -> None:
+    """The model card: every model the forecast runs on, and the one refit control.
+
+    The forecast is a pipeline -- attrition, then the finishing order, then a
+    season -- so the card lists the stages in that order rather than showing
+    only the one model that happens to have a file on disk.  The order models
+    are read from the shipped constants and refit from the parquets on every
+    request, so they have no staleness to report; the attrition model is a
+    saved artefact, and its freshness is the line worth watching.
 
     Refitting lives in the sidebar on every page because it is the answer to
     most of the warnings the pages raise, and because burying it would make the
     warnings advice rather than an action.
     """
     with st.sidebar:
-        st.subheader("Saved model")
+        st.subheader("Models in use")
+        year, through = services.forecast_position(services.forecast_version()) \
+            if services.forecast_ready()[0] else (None, None)
+        if year is not None:
+            st.caption(f"Data through **{year} R{through}**")
+
+        lines = []
+        for card in services.model_card():
+            stage = f" · `{card['stage']}`" if card["stage"] else ""
+            lines.append(f"**{card['name']}**{stage}  \n{card['detail']}")
         if manifest is None:
-            st.warning("Nothing fitted yet.")
+            lines.insert(0, "**Attrition (DNF)**  \nnot fitted yet")
         else:
-            st.caption(
-                f"**{manifest.model}** · `{manifest.stage}`\n\n"
+            fresh, _ = services.model_staleness(dataset, manifest)
+            lines.insert(0,
+                f"**Attrition (DNF)** · `{manifest.stage}`  \n"
+                f"{manifest.model} · {len(manifest.features)} feature(s) · "
                 f"through {manifest.trained_through_year} "
-                f"R{manifest.trained_through_round} "
-                f"({manifest.trained_through_event})\n\n"
-                f"{manifest.train_rows} rows · base rate "
-                f"{manifest.train_base_rate:.1%} · "
-                f"{len(manifest.features)} features\n\n"
-                f"lookback `{manifest.lookback_races}` · git `{manifest.git_sha}`\n\n"
-                f"fitted {manifest.trained_at}"
-            )
+                f"R{manifest.trained_through_round} · "
+                f"{'fresh ✓' if fresh else 'stale — refit below'}")
+        st.caption("\n\n".join(lines))
+        if manifest is not None:
+            with st.expander("Attrition model details"):
+                st.caption(
+                    f"through {manifest.trained_through_year} "
+                    f"R{manifest.trained_through_round} "
+                    f"({manifest.trained_through_event})\n\n"
+                    f"{manifest.train_rows} rows · base rate "
+                    f"{manifest.train_base_rate:.1%}\n\n"
+                    f"lookback `{manifest.lookback_races}` · git `{manifest.git_sha}`\n\n"
+                    f"fitted {manifest.trained_at}"
+                )
+        st.caption(
+            "The order models refit from the data on every request, so they "
+            "are never stale. Only the attrition model is saved to disk."
+        )
 
         st.divider()
-        with st.expander("Refit and save", expanded=manifest is None):
+        with st.expander("Refit attrition model", expanded=manifest is None):
             st.caption(
                 "Writes `Models/dnf_model.joblib` and its manifest. It does "
                 "**not** fetch new races — rebuild the dataset from a terminal "
@@ -144,6 +173,18 @@ def sidebar_status(dataset: pd.DataFrame, manifest) -> None:
             "Rebuild the dataset:\n\n"
             "`python -m src.data.generate_dataset --offline`"
         )
+
+
+def sidebar_trials() -> int:
+    """Simulated draws, for the pages that simulate."""
+    with st.sidebar:
+        st.divider()
+        return int(st.select_slider(
+            "Simulation trials", options=[2_000, 5_000, 10_000, 20_000],
+            value=season.DEFAULT_TRIALS, key="fc_trials",
+            help="Simulated seasons or races. More trials smooth the odds of "
+                 "rare outcomes; they do not make the model more right.",
+        ))
 
 
 def pooled_scores(log_block: pd.DataFrame) -> dict[str, float]:
@@ -237,7 +278,7 @@ def format_odds(p: float) -> str:
     """How a championship or podium probability is printed.
 
     This is a judgement about false precision, and the data for it is on the
-    Forecast page: the season simulation's 80% intervals held the true total
+    Track record page: the season simulation's 80% intervals held the true total
     only 70% (drivers) and 73% (constructors) of the time in the 2024-25
     backtest, so its extreme odds are *more confident than the evidence*.
     Printing 99.94% as ``99.9%`` or 0.03% as ``0.0%`` claims a resolution the
@@ -245,7 +286,7 @@ def format_odds(p: float) -> str:
 
     So the tails are capped: below 1% prints ``<1%`` and above 99% prints
     ``>99%``, and everything between keeps one decimal.  Used for every odds
-    column on the Forecast and Race weekend pages, so one rule decides them all.
+    column on the Home, Championship and Race pages, so one rule decides them all.
 
     Exact 0 and 1 are capped too.  A share of simulated trials cannot tell "no
     path to the title" from "a path too rare to turn up in 10,000 draws", and

@@ -1,4 +1,12 @@
-"""Read the per-race log: is it calibrated, is it drifting, is the grid worth it.
+"""How the forecast has scored: the finishing order first, then the attrition stage.
+
+The finishing-order section reads the two reports the CLI writes -- held-out
+scores from ``forecast evaluate --write`` and season calibration from
+``forecast backtest --write`` -- rather than recomputing them, because both
+are minutes of simulation and belong in a terminal.  Below them is the
+attrition model's per-race log.
+
+On the attrition log:
 
 The unit is a race, because that is the cadence the model runs at and it is how
 a problem actually announces itself — three bad weekends in a row, not a bad
@@ -29,11 +37,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app import charts, services  # noqa: E402
 from app.common import (  # noqa: E402
-    metric_row, page_setup, pooled_scores, require_dataset, sidebar_status,
-    source_note,
+    fmt_pct, metric_row, page_setup, pooled_scores, require_dataset,
+    sidebar_models, source_note,
 )
+from src.models import forecast  # noqa: E402
 
-page_setup("Model health", icon="📈")
+page_setup("Track record", icon="📈")
 
 version = services.data_version()
 if not require_dataset():
@@ -42,9 +51,106 @@ if not require_dataset():
 dataset = services.load_dataset(version)
 manifest = services.manifest_or_none()
 log = services.load_log(version)
-sidebar_status(dataset, manifest)
+sidebar_models(dataset, manifest)
 
-st.title("Model health")
+st.title("Track record")
+st.caption(
+    "Every score here is out-of-sample: each race was forecast by a model "
+    "fitted only on the races before it. Choices were made on 2020-2023 and "
+    "scored on 2024 onward."
+)
+
+# --------------------------------------------------------------------------- #
+# The finishing order
+# --------------------------------------------------------------------------- #
+
+st.subheader("Finishing order")
+
+#: The rows of the evaluation ladder worth showing, cheapest first: the naive
+#: baseline the model has to beat, then the shipped model.
+_BASELINE = {"pre_weekend": "team order", "post_quali": "grid order"}
+_SHIPPED = "selected + tuned"
+
+evaluation = services.order_evaluation()
+if evaluation is None:
+    st.info(
+        "No held-out scores on disk yet. Write them once with "
+        "`./.venv/bin/python -m src.models.forecast evaluate --write` "
+        "(several minutes) and this section fills in."
+    )
+else:
+    stage_labels = {"pre_weekend": "Before qualifying", "post_quali": "After qualifying"}
+    for column, stage in zip(st.columns(2), ("pre_weekend", "post_quali")):
+        block = evaluation.loc[evaluation["stage"] == stage].set_index("model")
+        with column:
+            st.markdown(f"**{stage_labels[stage]}**")
+            if _SHIPPED not in block.index:
+                st.caption("Not in the report on disk.")
+                continue
+            ours = block.loc[_SHIPPED]
+            base = block.loc[_BASELINE[stage]] if _BASELINE[stage] in block.index else None
+            metric_row([
+                ("RPS@10", f"{ours['rps10']:.4f}",
+                 f"{_BASELINE[stage]}: {base['rps10']:.4f}" if base is not None
+                 else "lower is better"),
+                ("Races", f"{int(ours['races'])}", "held out"),
+            ])
+            metric_row([
+                ("Calibration: win", f"{ours['calib_win']:.2f}", "1.00 is perfect"),
+                ("podium", f"{ours['calib_podium']:.2f}", ""),
+                ("points", f"{ours['calib_points']:.2f}", ""),
+            ])
+    with st.expander("The full evaluation ladder"):
+        columns = ["stage", "model", "races", "ll10_gain", "rps10", "points_rmse",
+                   "spearman", "brier_win", "calib_win", "calib_podium", "calib_points"]
+        st.dataframe(evaluation[[c for c in columns if c in evaluation.columns]],
+                     hide_index=True, width="stretch")
+        st.caption(
+            "Each rung has to beat the one above it to justify itself. RPS@10 "
+            "is the ranked probability score over the points positions; a "
+            "calibration slope above 1 means the model was underconfident, "
+            "below 1 overconfident."
+        )
+
+st.markdown("**Season simulation**")
+backtest = services.season_calibration()
+shipped = forecast.DEFAULT_SEASON_NOISE.team_sd
+row = None
+if backtest is not None:
+    calibration, seasons = backtest
+    row = calibration.loc[
+        (calibration["team_sd"].sub(shipped).abs() < 1e-9)
+        & (calibration["driver_sd"] == 0)
+    ].set_index("kind")
+if row is None or row.empty:
+    st.info(
+        "No season backtest at the shipped setting on disk. Build it with "
+        "`./.venv/bin/python -m src.models.forecast backtest --write`."
+    )
+else:
+    metric_row([
+        ("Driver 80% band held", fmt_pct(row.loc["driver", "coverage80"]),
+         f"should be 80% · {int(row.loc['driver', 'entities'])} driver-seasons"),
+        ("Constructor 80% band held", fmt_pct(row.loc["team", "coverage80"]),
+         f"should be 80% · {int(row.loc['team', 'entities'])} team-seasons"),
+        ("Seasons", ", ".join(map(str, seasons)), f"team_sd {shipped}"),
+    ])
+    st.caption(
+        "Both short of 80%: the championship bands are too narrow and the "
+        "extreme odds too confident. The open fix is per-driver pace noise, "
+        "so team-mates can move apart."
+    )
+
+# --------------------------------------------------------------------------- #
+# The attrition stage
+# --------------------------------------------------------------------------- #
+
+st.divider()
+st.subheader("Attrition stage")
+st.caption(
+    "The retirement model's per-race log, one row per scored race. It feeds "
+    "the forecast's P(out), and it is the one stage with a live weekly loop."
+)
 
 if log.empty:
     st.info(

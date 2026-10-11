@@ -136,3 +136,13 @@ def test_each_sample_can_carry_its_own_strengths() -> None:
     pos = sample_positions(s, np.zeros_like(s, dtype=bool), None, rng)
     assert (pos[:20_000, 3] == 1).mean() < 0.05
     assert (pos[20_000:, 3] == 1).mean() > 0.9
+
+
+def test_contributions_sum_to_the_strength_even_with_missing_values(races) -> None:
+    """The attribution the dashboard draws is the model, not an approximation of it."""
+    model = PlackettLuce(["f0", "f1", "f2"], l2=0.01).fit(races, races["pos"])
+    rows = races.head(40).copy()
+    rows.loc[rows.index[:5], "f1"] = np.nan  # imputed with the training median
+    parts = model.contributions(rows)
+    assert list(parts.columns) == ["f0", "f1", "f2"]
+    np.testing.assert_allclose(parts.sum(axis=1), model.strength(rows), atol=1e-12)
